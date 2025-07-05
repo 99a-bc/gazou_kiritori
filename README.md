@@ -24,7 +24,7 @@ git clone https://github.com/99a-bc/gazou_kiritori.git
 
 
 ## 起動方法
-1. run_gazou_kiritori.batをダブルクリック
+- run_gazou_kiritori.batをダブルクリック
 
 
 ## 使い方
