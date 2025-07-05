@@ -58,7 +58,7 @@ git clone https://github.com/99a-bc/gazou_kiritori.git
 
   または右クリック押下しながら左右ドラッグ(左：前画像、右：次画像)
 
-- 拡大・縮小
+- 拡大/縮小
 
   マウスホイール回転
   
