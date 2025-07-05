@@ -25,11 +25,11 @@
 git clone https://github.com/99a-bc/gazou_kiritori.git
 ```
 
-2. 'install.bat'をダブルクリック
+2. `install.bat`をダブルクリック
 
 
 ## 起動方法
-- 'run_gazou_kiritori.bat'をダブルクリック
+- `run_gazou_kiritori.bat`をダブルクリック
 
 
 ## 使い方
