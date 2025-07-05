@@ -15,7 +15,7 @@
 
 ## 要件
 - Python(3.12で動作確認済み、たぶん3.10以上であれば動きます)
-- pillow
+- Pillow
 - PyQt6 
 
 ## インストール手順
@@ -25,11 +25,11 @@
 git clone https://github.com/99a-bc/gazou_kiritori.git
 ```
 
-2. install.batをダブルクリック
+2. 'install.bat'をダブルクリック
 
 
 ## 起動方法
-- run_gazou_kiritori.batをダブルクリック
+- 'run_gazou_kiritori.bat'をダブルクリック
 
 
 ## 使い方
