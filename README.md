@@ -39,6 +39,7 @@ git clone https://github.com/99a-bc/gazou_kiritori.git
    現在の保存先は右下付近に表示されています。
 
 
+
 ##その他機能
 
 次/前の画像へ移動
