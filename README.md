@@ -52,7 +52,7 @@ git clone https://github.com/99a-bc/gazou_kiritori.git
 
 ## その他機能
 
-- 次/前の画像へ移動
+- 前/次の画像へ移動
 
   ctrl ＋ ←　→
 
