@@ -15,7 +15,7 @@
 ## インストール手順
 1. このリポジトリを任意のフォルダにクローンまたはzipダウンロード
 
-```bash git clone https://github.com/99a-bc/gazou_kiritori.git ``` 
+<pre> ```bash git clone https://github.com/99a-bc/gazou_kiritori.git ``` </pre>
 
 2. install.batをダブルクリック
 
