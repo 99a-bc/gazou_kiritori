@@ -1,2 +1,4 @@
 pillow==11.2.1
 PyQt6==6.9.1
+py7zr==1.0.0
+rarfile==4.2
