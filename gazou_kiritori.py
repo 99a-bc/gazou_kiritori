@@ -41,7 +41,7 @@ except Exception:
     py7zr = None
 
 APP_NAME = "画像切り取りツール"
-APP_VERSION = "1.1.0" 
+APP_VERSION = "1.1.1" 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
@@ -4177,24 +4177,57 @@ class ThumbnailListModel(QtCore.QAbstractListModel):
         self.dirOverlayReady.connect(self._apply_dir_overlay) 
 
     def invalidate_path(self, path: str):
-        key = os.path.normcase(os.path.abspath(path))   # ← abspath を必ず使う
-        self._cache.pop(key, None)                      # 既存キャッシュ破棄
-        self._force_rebuild.add(key)                    # ★ 次の1回はキャッシュ無視
-
+        # VFS/zip:// も壊さない統一キー
         try:
-            row = self.image_list.index(path)
-        except ValueError:
+            key = norm_vpath(path)
+        except Exception:
+            key = path
+
+        # 既存キャッシュ破棄＆次の1回は強制再生成
+        try:
+            self._cache.pop(key, None)
+            self._force_rebuild.add(key)
+        except Exception:
+            pass
+
+        # row を“同じ正規化キー”で探す
+        row = -1
+        try:
+            for i, p in enumerate(self.image_list):
+                try:
+                    if norm_vpath(p) == key:
+                        row = i
+                        break
+                except Exception:
+                    if p == path:
+                        row = i
+                        break
+        except Exception:
+            row = -1
+
+        if row < 0:
             return
 
-        if 0 <= row < len(self.thumbnails):
-            self.thumbnails[row] = None
-        self._pending_rows.discard(row)
+        # 既存スロットを空にして再キュー
+        try:
+            if 0 <= row < len(self.thumbnails):
+                self.thumbnails[row] = None
+        except Exception:
+            pass
 
-        self._pending_rows.add(row)
-        self._pool.start(_ThumbTask(self._generate_thumb, row))
+        try:
+            self._pending_rows.discard(row)
+            self._pending_rows.add(row)
+            self._pool.start(_ThumbTask(self._generate_thumb, row))
+        except Exception:
+            pass
 
-        idx = self.index(row, 0)
-        self.dataChanged.emit(idx, idx, [QtCore.Qt.ItemDataRole.DecorationRole])
+        # 表示更新通知
+        try:
+            idx = self.index(row, 0)
+            self.dataChanged.emit(idx, idx, [QtCore.Qt.ItemDataRole.DecorationRole])
+        except Exception:
+            pass
 
     def _system_dir_icon(self, path: str) -> QtGui.QIcon:
         """サムネ用：フォルダ or zip のアイコンを返す
@@ -5302,6 +5335,41 @@ class CropperApp(QtWidgets.QMainWindow):
         flip_row.setContentsMargins(0, 0, 0, 0)
         flip_row.setSpacing(8)
 
+
+        # ★ 一括切り取りボタン
+        self.btn_batch_crop = QtWidgets.QPushButton("一括\n切り取り")
+        self.btn_batch_crop.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.btn_batch_crop.setFixedSize(72, 72)
+        self.btn_batch_crop.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self.btn_batch_crop.setCursor(
+            QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        )
+
+        # ★ 一括切り取りだけ紫枠にする
+        self.btn_batch_crop.setStyleSheet("""
+        QPushButton {
+            background:#2b2b2b;
+            color:#e0e0e0;
+            border:2px solid #b36bff;      /* ← 紫の外枠 */
+            border-radius:10px;
+            padding:0px;
+            font-size: 11pt;
+        }
+        QPushButton:hover  {
+            background:#454545;
+            border-color:#d7adff;
+        }
+        QPushButton:pressed{
+            background:#222222;
+            border-color:#8f3dff;
+        }
+        """)
+
+        self.btn_batch_crop.clicked.connect(self.on_batch_crop_clicked)
+
         # 左：水平反転ボタン
         flip_row.addWidget(
             self.btn_flip_horizontal,
@@ -5319,6 +5387,13 @@ class CropperApp(QtWidgets.QMainWindow):
         # 右：左右分割の 90度回転ボタン
         flip_row.addWidget(
             self.btn_rotate_90,
+            0,
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignBottom
+        )
+
+        # ★ 一括切り取りボタン
+        flip_row.addWidget(
+            self.btn_batch_crop,
             0,
             QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignBottom
         )
@@ -6933,6 +7008,11 @@ class CropperApp(QtWidgets.QMainWindow):
         file_path = norm_vpath(file_path)       # ← zip:// を壊さない正規化
         folder    = vfs_parent(file_path)       # ← 親（zip内でもOK）
         log_debug(f"[open] path={file_path}")
+
+        # === 0) 一括クロップ用の回転/反転履歴をリセット ===
+        # 画像を開くたびに履歴をクリアしておくと、
+        # 以前の画像で行った回転/反転が一括クロップに混ざるのを防げる。
+        self._batch_transform_ops = []
 
         # === 1) 次回だけUI温存フラグ（読み出して即クリア） ===
         preserve = getattr(self, "_preserve_ui_on_next_load", None)
@@ -9445,6 +9525,21 @@ class CropperApp(QtWidgets.QMainWindow):
 
         self.show_image()
 
+    def _record_batch_transform(self, op: str):
+        """
+        一括切り取り用に、画像変形の履歴を記録する。
+        op: 'flip_h' | 'flip_v' | 'rot_left_90' | 'rot_right_90'
+        """
+        ops = getattr(self, "_batch_transform_ops", None)
+        if ops is None:
+            ops = []
+            self._batch_transform_ops = ops
+        ops.append(op)
+
+    def _get_batch_transform_ops(self):
+        """記録済みの変形履歴を返す（無ければ空リスト）。"""
+        return list(getattr(self, "_batch_transform_ops", []) or [])
+
     def on_flip_horizontal(self):
         """画像を左右反転。選択中の矩形も一緒に左右反転させる。"""
         if getattr(self, "image", None) is None:
@@ -9458,6 +9553,8 @@ class CropperApp(QtWidgets.QMainWindow):
             log_debug("[flip] horizontal flip failed:", e)
             QtWidgets.QApplication.beep()
             return
+        
+        self._record_batch_transform("flip_h")
 
         img_w = self.image.width
 
@@ -9478,12 +9575,7 @@ class CropperApp(QtWidgets.QMainWindow):
             # 左右反転：新しい left = W - (old_left + width)
             new_left = img_w - (x + w)
 
-            # 念のため画像内にクランプ
-            if new_left < 0:
-                new_left = 0
-            if new_left + w > img_w:
-                w = max(0, img_w - new_left)
-
+            # ★ 画像内クランプはしない（はみ出しを維持）
             return QtCore.QRect(new_left, y, w, h)
 
         # 2) 画像座標の矩形を左右反転
@@ -9546,6 +9638,8 @@ class CropperApp(QtWidgets.QMainWindow):
             log_debug("[flip] vertical flip failed:", e)
             QtWidgets.QApplication.beep()
             return
+        
+        self._record_batch_transform("flip_v")
 
         img_h = self.image.height
 
@@ -9566,12 +9660,7 @@ class CropperApp(QtWidgets.QMainWindow):
             # 上下反転：新しい top = H - (old_top + height)
             new_top = img_h - (y + h)
 
-            # 念のため画像内にクランプ
-            if new_top < 0:
-                new_top = 0
-            if new_top + h > img_h:
-                h = max(0, img_h - new_top)
-
+            # ★ 画像内クランプはしない（はみ出しを維持）
             return QtCore.QRect(x, new_top, w, h)
 
         # 2) 画像座標の矩形を上下反転
@@ -9643,6 +9732,13 @@ class CropperApp(QtWidgets.QMainWindow):
             log_debug("[rotate] unsupported op_const:", op_const)
             return
 
+        try:
+            self._record_batch_transform(
+                "rot_left_90" if direction == "left" else "rot_right_90"
+            )
+        except Exception:
+            pass
+
         # --- 元画像サイズ & 元の矩形を取得 ---
         old_w, old_h = self.image.size
 
@@ -9711,6 +9807,16 @@ class CropperApp(QtWidgets.QMainWindow):
         self._base_pixmap_dirty = True
         self._scaled_pixmap = None
         self._scaled_key = None
+
+        # ★★ 追加ポイント ★★
+        # 90度回転すると画像の縦横が入れ替わるので、
+        # ズームの基準サイズも入れ替えておく。
+        if self.base_display_width is not None and self.base_display_height is not None:
+            self.base_display_width, self.base_display_height = (
+                self.base_display_height,
+                self.base_display_width,
+            )
+
         self.show_image()
 
         # 固定枠モードならUI同期
@@ -10538,6 +10644,27 @@ class CropperApp(QtWidgets.QMainWindow):
                 self.update_crop_size_label(self._crop_rect_img, img_space=True)
                 self._schedule_preview(self._crop_rect_img)
 
+    def _ensure_jpeg_compatible(self, img, save_ext: str):
+        """
+        JPEG保存に備えて Pillow Image を安全化する。
+        - αを含む場合は白背景に合成してRGB化
+        - JPEGが受け付けないモードはRGBへ
+        """
+        try:
+            save_ext = (save_ext or "").lower()
+            if save_ext in ("jpg", "jpeg"):
+                if "A" in img.getbands():
+                    # 透過は白で合成
+                    from PIL import Image
+                    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+                    img = Image.alpha_composite(bg, img.convert("RGBA")).convert("RGB")
+                elif img.mode not in ("RGB", "L", "CMYK"):
+                    img = img.convert("RGB")
+        except Exception:
+            # ここで落とすと保存全体が死ぬので黙ってフォールバック
+            pass
+        return img
+
     def save_cropped(self, rect):
         if self.image is None:
             return False, "画像が読み込まれていません"
@@ -10624,104 +10751,98 @@ class CropperApp(QtWidgets.QMainWindow):
                 save_kw.update(dict(quality=90, method=6))
             elif save_ext == "png":
                 save_kw.update(dict(compress_level=6))
-            if exif: save_kw["exif"] = exif
-            if icc:  save_kw["icc_profile"] = icc
-
-            # JPEG で α を含む/非対応モードは安全化
-            def _ensure_jpeg_compatible(img):
-                if save_ext in ("jpg","jpeg"):
-                    if "A" in img.getbands():
-                        # 透過は白で合成
-                        from PIL import Image
-                        bg = Image.new("RGBA", img.size, (255,255,255,255))
-                        img = Image.alpha_composite(bg, img.convert("RGBA")).convert("RGB")
-                    elif img.mode not in ("RGB","L","CMYK"):
-                        img = img.convert("RGB")
-                return img
+            if exif:
+                save_kw["exif"] = exif
+            if icc:
+                save_kw["icc_profile"] = icc
 
             # ========== 上書き保存モード ==========
             if getattr(self, "overwrite_mode", False):
                 import shutil
 
-                # ★★★ zip内でも inner のファイル名だけで上書き保存 ★★★
                 if self.save_folder:
-                    # save_root も更新しておく（連番保存側と同じルール）
                     save_root = Path(self.save_folder).expanduser()
                     save_root.mkdir(parents=True, exist_ok=True)
                     folder = str(save_root)
 
-                # 保存先で同名に上書き（ルート + ファイル名だけ）
                 dst_path = str(save_root / output_name)
 
-
-                # ---- UI温存トークン（次の読込1回だけ）----
-                try:
-                    state = self._snapshot_adjust_state()
-                    if not state:
-                        state = {"rect": "full"}
-                except Exception:
-                    # 最低限の温存（固定/調整情報は後からでも復元できるのでfullで）
-                    state = {"rect": "full"}
-                self._preserve_ui_on_next_load = state
-
                 # ---- “全体覆い”かつロッシー形式はコピーで無劣化 ----
-                if is_full_cover and orig_ext in ("jpg","jpeg","webp"):
+                if is_full_cover and orig_ext in ("jpg", "jpeg", "webp"):
                     try:
                         if os.path.normcase(os.path.abspath(self.image_path)) != os.path.normcase(os.path.abspath(dst_path)):
                             shutil.copy2(self.image_path, dst_path)
-                        # 同一路線での上書きなら何もしない（内容は同一）
                         print("上書き保存(コピーで無劣化):", dst_path)
                     except Exception as e:
                         print("[SAVE WARNING] copy2失敗 -> エンコード保存にフォールバック:", e)
-                        _ensure_jpeg_compatible(cropped).save(dst_path, **save_kw)
+                        self._ensure_jpeg_compatible(cropped, save_ext).save(dst_path, **save_kw)
                         print("上書き保存(エンコード):", dst_path)
                 else:
-                    # 通常（トリミング or 可逆形式）
-                    _ensure_jpeg_compatible(cropped).save(dst_path, **save_kw)
+                    self._ensure_jpeg_compatible(cropped, save_ext).save(dst_path, **save_kw)
                     print("上書き保存:", dst_path)
 
                 # mtime を確実に動かす（低粒度FS対策）
-                try: os.utime(dst_path, None)
-                except Exception: pass
-
-                # 次の読み込み1回だけ保存先ダイアログを抑止
                 try:
-                    s = getattr(self, "_suppress_save_dialog_paths", None)
-                    if s is None:
-                        s = set(); self._suppress_save_dialog_paths = s
-                    s.add(os.path.normcase(os.path.abspath(dst_path)))   # 既存：保存先
+                    os.utime(dst_path, None)
                 except Exception:
                     pass
 
-                # 再読み込み（保存先が別フォルダでも“今の読み込み元”は維持する）
+                # ★ 上書き時の「開き直し」条件分岐
+                #   1) 保存先が読込元と同一 → 開き直して即反映
+                #   2) 保存先が別           → 開き直しなし
                 try:
-                    src_dir = os.path.normcase(os.path.abspath(os.path.dirname(self.image_path)))
-                    dst_dir = os.path.normcase(os.path.abspath(os.path.dirname(dst_path)))
+                    # 読み込み元の“基準フォルダ”
+                    # （zip:// 等も考慮したいなら _get_image_source_dir を使うのが安全）
+                    src_dir = os.path.normcase(os.path.abspath(self._get_image_source_dir(self.image_path)))
+
+                    # 保存先フォルダ（save_root は overwrite ブロックで確定済み）
+                    dst_dir = os.path.normcase(os.path.abspath(str(save_root)))
+
                     if src_dir == dst_dir:
-                        self.open_image_from_path(dst_path)
-                    else:
-                        # ★追加：今回“再読み込みする側”＝元画像も1回だけダイアログ抑止
+                        # 可能ならUI状態を温存してから開き直す
                         try:
-                            s.add(os.path.normcase(os.path.abspath(self.image_path)))
+                            state = self._snapshot_adjust_state()
+                            if not state:
+                                state = {"rect": "full"}
+                        except Exception:
+                            state = {"rect": "full"}
+                        self._preserve_ui_on_next_load = state
+
+                        # 次の読み込み1回だけ保存先ダイアログ抑止（持っているなら）
+                        try:
+                            s = getattr(self, "_suppress_save_dialog_paths", None)
+                            if s is None:
+                                s = set()
+                                self._suppress_save_dialog_paths = s
+                            s.add(os.path.normcase(os.path.abspath(dst_path)))
                         except Exception:
                             pass
-                        self.open_image_from_path(self.image_path)
+
+                        # 同一フォルダ上書きは “保存した実体” を開き直す
+                        try:
+                            self.open_image_from_path(dst_path)
+                        except Exception:
+                            pass
+                    else:
+                        # 保存先が別フォルダなら、見た目リセットを避けるため開き直さない
+                        pass
+
                 except Exception:
                     pass
-
-                # 対象サムネだけ再生成（モデルがあれば）
+                
                 try:
                     if getattr(self, "model", None):
-                        self.model.invalidate_path(os.path.normpath(dst_path))
-                except Exception:
-                    pass
+                        print("[thumb] invalidate request:", dst_path)
+                        self.model.invalidate_path(dst_path)
+                except Exception as e:
+                    print("[thumb] invalidate request failed:", e)
 
                 return True, dst_path
 
             # ========== 通常（連番保存） ==========
             # ① α有のときJPEGは避け、pngに自動切替
             has_alpha = ("A" in cropped.getbands())
-            if save_ext in ("jpg","jpeg") and has_alpha:
+            if save_ext in ("jpg", "jpeg") and has_alpha:
                 save_ext = "png"
 
             # ② 連番を探す
@@ -10738,21 +10859,18 @@ class CropperApp(QtWidgets.QMainWindow):
 
             candidate = str(candidate)  # この先は文字列として扱う
 
-            if i >= 1000:
-                raise RuntimeError("保存先に連番の空きがありません (001-999).")
-
             # ③ “全体覆い”かつ ロッシー形式で拡張子も同じなら コピーで無劣化
-            if is_full_cover and save_ext in ("jpg","jpeg","webp") and save_ext == orig_ext:
+            if is_full_cover and save_ext in ("jpg", "jpeg", "webp") and save_ext == orig_ext:
                 try:
                     import shutil
                     shutil.copy2(self.image_path, candidate)
                     print("保存(コピーで無劣化):", candidate)
                 except Exception as e:
                     print("[SAVE WARNING] copy2失敗 -> エンコード保存にフォールバック:", e)
-                    _ensure_jpeg_compatible(cropped).save(candidate, **save_kw)
+                    self._ensure_jpeg_compatible(cropped, save_ext).save(candidate, **save_kw)
                     print("保存(エンコード):", candidate)
             else:
-                _ensure_jpeg_compatible(cropped).save(candidate, **save_kw)
+                self._ensure_jpeg_compatible(cropped, save_ext).save(candidate, **save_kw)
                 print("保存:", candidate)
 
             return True, candidate
@@ -10760,6 +10878,501 @@ class CropperApp(QtWidgets.QMainWindow):
         except Exception as e:
             print("[SAVE ERROR]", e)
             return False, str(e)
+
+    # ------------------------------
+    # 一括切り取り（現在フォルダ内の画像全部）
+    # ------------------------------
+    def on_batch_crop_clicked(self):
+        """
+        現在の切り出し矩形をテンプレにして、同じフォルダ内の全画像を一括で切り取り保存する。
+        - 解像度が違う画像は「元画像に対する割合」で矩形を再計算する
+        - ★ ただし割合化の前に「基準画像の範囲内へ矩形をクリップ」する
+        - ★ 解像度/アスペクト比が混在していそうなら警告して
+          「近似モードで続行」「中止」を選ばせる
+        - 保存先は現在の設定（同じフォルダ / 別フォルダ）に従う
+        """
+        from PyQt6.QtWidgets import QMessageBox, QProgressDialog
+        import os, traceback
+
+        # ---- ロガーがあれば使う ----
+        def _log(*args):
+            try:
+                log_debug(*args)
+            except Exception:
+                pass
+
+        # ---- ベースとなる画像＆矩形が無い場合は中止 ----
+        if self.image is None or self._crop_rect_img is None:
+            _log("[BATCH] base image/rect missing",
+                 "image?", self.image is not None,
+                 "rect?", self._crop_rect_img is not None)
+            QMessageBox.warning(self, "一括切り取り", "一括切り取りの元になる切り出し範囲がありません。")
+            return
+
+        base_img = self.image
+        try:
+            base_w, base_h = base_img.size
+        except Exception:
+            _log("[BATCH] base_img.size failed\n" + traceback.format_exc())
+            QMessageBox.warning(self, "一括切り取り", "現在の画像サイズを取得できません。")
+            return
+
+        rect = QtCore.QRect(self._crop_rect_img).normalized()
+        _log("[BATCH] base size:", (base_w, base_h))
+        _log("[BATCH] base rect img:", rect)
+
+        if rect.width() <= 0 or rect.height() <= 0:
+            _log("[BATCH] invalid rect size:", rect.width(), rect.height())
+            QMessageBox.warning(self, "一括切り取り", "切り出し範囲が正しくありません。")
+            return
+
+        # =========================================================
+        # ★ 1) 基準画像側で一回クリップしてから比率化
+        # =========================================================
+        base_bounds = QtCore.QRect(0, 0, int(base_w), int(base_h))
+        clipped = rect.intersected(base_bounds)
+
+        # QRect.intersected は交差が無いと width/height 0 になりがちなので保険
+        if clipped.isNull() or clipped.width() <= 0 or clipped.height() <= 0:
+            _log("[BATCH] rect outside base after clip:", clipped)
+            QMessageBox.warning(
+                self, "一括切り取り",
+                "切り出し範囲が基準画像の外にはみ出しています。\n"
+                "基準画像内に収まる範囲で矩形を作り直してください。"
+            )
+            return
+
+        if clipped != rect:
+            _log("[BATCH] base rect clipped:",
+                 "from", rect, "to", clipped)
+        rect = clipped
+
+        # 画像座標 → 割合に変換（クリップ後）
+        fx = rect.left() / base_w
+        fy = rect.top() / base_h
+        fw = rect.width() / base_w
+        fh = rect.height() / base_h
+
+        _log("[BATCH] base ratios:", "fx=", fx, "fy=", fy, "fw=", fw, "fh=", fh)
+
+        # ---- 対象となる画像一覧（現状の image_list を受ける） ----
+        raw_paths = list(getattr(self, "image_list", []) or [])
+        _log("[BATCH] raw image_list len =", len(raw_paths))
+
+        # デバッグのため、まず中身をざっくり表示
+        for p in raw_paths[:50]:
+            try:
+                s = str(p)
+                ext = os.path.splitext(s)[1].lower()
+                _log("[BATCH] raw item:", repr(s), "ext=", ext, "zip_uri=", is_zip_uri(s))
+            except Exception:
+                _log("[BATCH] raw item inspect failed:", repr(p))
+
+        if not raw_paths:
+            QMessageBox.information(self, "一括切り取り", "一括切り取りの対象となる画像がありません。")
+            return
+
+        # ここで「画像名だけ」にフィルタ
+        paths = []
+        for p in raw_paths:
+            try:
+                s = str(p)
+                if is_image_name(s) or is_image_name(os.path.basename(s)):
+                    paths.append(s)
+            except Exception:
+                pass
+
+        _log("[BATCH] filtered paths len =", len(paths))
+        for p in paths[:50]:
+            _log("[BATCH] use:", repr(p))
+
+        if not paths:
+            _log("[BATCH] no image-like entries after filter")
+            QMessageBox.information(self, "一括切り取り", "対象になりそうな画像が見つかりません。")
+            return
+
+        # =========================================================
+        # ★ 2) 解像度・アスペクト比のばらつきを軽く集計して警告
+        #    - “回転履歴”を考慮した見た目サイズで判定して
+        #      いらんタイミングの警告を抑止する
+        # =========================================================
+
+        # ---- 現在の回転/反転履歴を取得（警告判定と実処理で共通に使う）----
+        ops = []
+        try:
+            if hasattr(self, "_get_batch_transform_ops"):
+                ops = self._get_batch_transform_ops() or []
+        except Exception:
+            ops = []
+
+        # ---- ★ 回転履歴だけをサイズに反映するライト関数 ----
+        #      （警告用：画像を実際に開いて回す必要はない）
+        def _apply_ops_to_wh(w0: int, h0: int):
+            w = int(w0); h = int(h0)
+            for op in ops:
+                if op in ("rot_left_90", "rot_right_90"):
+                    w, h = h, w
+            return w, h
+
+        # ---- ★ 警告に使う“基準サイズ”の扱い ----
+        # base_w/base_h は「現在表示中の self.image」由来で
+        # 既に回転が反映されている場合がある。
+        # ここでさらに ops を当てると 90°回転が二重適用され、
+        # 不要な“解像度/比率混在”警告の原因になる。
+        #
+        # なので警告用の基準は「元ファイルサイズ」→ ops で算出する。
+        raw_base_w, raw_base_h = base_w, base_h
+        try:
+            if getattr(self, "image_path", None):
+                _raw_img = open_image_any(self.image_path)
+                raw_base_w, raw_base_h = _raw_img.size
+        except Exception:
+            pass
+
+        warn_base_w, warn_base_h = _apply_ops_to_wh(raw_base_w, raw_base_h)
+        # デバッグしたいなら一時的にON
+        _log("[BATCH] warn base raw:", (raw_base_w, raw_base_h), "ops:", ops, "->", (warn_base_w, warn_base_h))
+
+        def _collect_variance_info(sample_paths, max_probe=120):
+            sizes = []
+            ars = []
+            probed = 0
+            failed = 0
+
+            for sp in sample_paths[:max_probe]:
+                try:
+                    img = open_image_any(sp)
+                    w, h = img.size
+
+                    # ★ 回転履歴を考慮した“見た目サイズ”で集計
+                    w, h = _apply_ops_to_wh(w, h)
+
+                    sizes.append((int(w), int(h)))
+                    if h:
+                        ars.append(float(w) / float(h))
+                    probed += 1
+                except Exception:
+                    failed += 1
+
+            uniq_sizes = sorted(set(sizes))
+
+            # ★ 基準ARも「回転履歴を反映した基準サイズ」で計算
+            base_ar = (float(warn_base_w) / float(warn_base_h)) if warn_base_h else 0.0
+
+            max_ar_delta = 0.0
+            min_ar = None
+            max_ar = None
+            if ars:
+                min_ar = min(ars)
+                max_ar = max(ars)
+                max_ar_delta = max(abs(min_ar - base_ar), abs(max_ar - base_ar))
+
+            return {
+                "probed": probed,
+                "failed": failed,
+                "uniq_sizes": uniq_sizes,
+                "uniq_size_count": len(uniq_sizes),
+
+                # ★ 表示用の基準サイズ/ARも警告専用の値に
+                "base_size": (int(warn_base_w), int(warn_base_h)),
+                "base_ar": base_ar,
+
+                "min_ar": min_ar,
+                "max_ar": max_ar,
+                "max_ar_delta": max_ar_delta,
+            }
+
+        info = _collect_variance_info(paths)
+
+        # ★ ここが最重要ログ
+        _log("[BATCH] WARN info:", info)
+
+        # しきい値は「実用でウザくなりにくい」程度に緩め
+        # - サイズが2種類以上
+        # - あるいは基準ARとの差がそこそこ大きい
+        need_warn = (
+            info["uniq_size_count"] >= 2
+            or (info["max_ar_delta"] is not None and info["max_ar_delta"] >= 0.08)
+        )
+
+        if need_warn:
+            # 表示用テキスト
+            uniq_preview = info["uniq_sizes"][:8]
+            uniq_txt = ", ".join([f"{w}×{h}" for (w, h) in uniq_preview])
+            if info["uniq_size_count"] > len(uniq_preview):
+                uniq_txt += f" ...(+{info['uniq_size_count']-len(uniq_preview)})"
+
+            ar_txt = "—"
+            if info["min_ar"] is not None and info["max_ar"] is not None:
+                ar_txt = f"{info['min_ar']:.3f} ～ {info['max_ar']:.3f}"
+
+            warn_msg = (
+                "フォルダ内に、解像度やアスペクト比が異なる画像が混在している可能性があります。\n\n"
+                f"基準画像: {info['base_size'][0]}×{info['base_size'][1]}  (AR={info['base_ar']:.3f})\n"
+                f"検査サンプル: {info['probed']} 枚  / 失敗: {info['failed']} 枚\n"
+                f"検出された解像度の種類: {info['uniq_size_count']}\n"
+                f"例: {uniq_txt}\n"
+                f"サンプルAR範囲: {ar_txt}\n\n"
+                "このまま続行すると、画像によっては意図と違う位置/範囲が切り取られるかもしれません。\n"
+                "（基準矩形を割合に換算して近似クロップします）"
+            )
+
+            mb = QMessageBox(self)
+            mb.setIcon(QMessageBox.Icon.Warning)
+            mb.setWindowTitle("一括切り取り")
+            mb.setText("解像度/比率の混在を検出しました")
+            mb.setInformativeText(warn_msg)
+
+            btn_continue = mb.addButton("近似モードで続行", QMessageBox.ButtonRole.AcceptRole)
+            btn_cancel = mb.addButton("中止", QMessageBox.ButtonRole.RejectRole)
+            mb.setDefaultButton(btn_cancel)
+
+            mb.exec()
+            if mb.clickedButton() != btn_continue:
+                _log("[BATCH] canceled at variance warning")
+                return
+
+        # =========================================================
+        # 3) 通常の最終確認
+        # =========================================================
+        msg = (
+            f"現在の切り出し範囲を元に、このフォルダ内の画像 {len(paths)} 枚を\n"
+            f"一括で切り取り＆保存します。\n\n"
+            f"・保存先: 現在の設定に従います\n"
+            f"・上書きモード: {'上書き保存' if getattr(self, 'overwrite_mode', False) else '連番保存'}\n\n"
+            f"よろしいですか？"
+        )
+        ret = QMessageBox.question(
+            self, "一括切り取り", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            _log("[BATCH] canceled by user")
+            return
+
+        # ---- 進捗ダイアログ ----
+        progress = QProgressDialog("一括切り取り中.", "キャンセル", 0, len(paths), self)
+        progress.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+
+        errors = 0
+        processed = 0
+        first_error_text = None
+
+        # ★ 上書き＆同一フォルダ時の即時反映用
+        overwrite = bool(getattr(self, "overwrite_mode", False))
+        changed_paths = []
+        reload_current_after = False
+
+        # =========================================================
+        # 4) 実処理
+        # =========================================================
+        for i, src in enumerate(paths, start=1):
+            progress.setValue(i - 1)
+            progress.setLabelText(f"一括切り取り中.\n{src}")
+            QtWidgets.QApplication.processEvents()
+            if progress.wasCanceled():
+                _log("[BATCH] canceled during progress")
+                break
+
+            try:
+                from PIL import Image, ImageOps
+
+                # 画像を開く
+                img = open_image_any(src)
+
+                # ★ 今の画像に至る変形履歴を、対象画像にも同じ順序で適用
+                for op in ops:
+                    if op == "flip_h":
+                        img = ImageOps.mirror(img)
+                    elif op == "flip_v":
+                        img = ImageOps.flip(img)
+                    elif op == "rot_left_90":
+                        img = img.transpose(Image.ROTATE_90)
+                    elif op == "rot_right_90":
+                        img = img.transpose(Image.ROTATE_270)
+
+                # 変形後サイズで割合クロップする
+                w, h = img.size
+
+                # 割合からこの画像の矩形を計算
+                x = int(round(fx * w))
+                y = int(round(fy * h))
+                cw = int(round(fw * w))
+                ch = int(round(fh * h))
+
+                _log("[BATCH] opened size:", (w, h))
+                _log("[BATCH] calc rect:", (x, y, cw, ch))
+
+                # 画面外に出ないようにクリップ
+                if cw <= 0 or ch <= 0:
+                    raise ValueError("切り出し範囲が画像外になりました（cw/ch<=0）。")
+
+                if x < 0:
+                    cw += x
+                    x = 0
+                if y < 0:
+                    ch += y
+                    y = 0
+                if x + cw > w:
+                    cw = w - x
+                if y + ch > h:
+                    ch = h - y
+
+                _log("[BATCH] clipped rect:", (x, y, cw, ch))
+
+                if cw <= 0 or ch <= 0:
+                    raise ValueError("切り出し範囲が画像外になりました（after clip）。")
+
+                cropped = img.crop((x, y, x + cw, y + ch))
+
+                # 保存先フォルダとファイル名を決定して保存
+                save_root = self._resolve_batch_save_root(src)
+                save_root.mkdir(parents=True, exist_ok=True)
+                dst_path = self._build_batch_output_path(save_root, src)
+
+                # 拡張子判定
+                dst_ext = dst_path.suffix.lower()
+                if dst_ext not in (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"):
+                    dst_ext = ".png"
+                    dst_path = dst_path.with_suffix(dst_ext)
+
+                save_kwargs: dict = {}
+                if dst_ext in (".jpg", ".jpeg"):
+                    # 既存実装の引数違いに両対応
+                    try:
+                        cropped = self._ensure_jpeg_compatible(cropped, dst_ext.lstrip("."))
+                    except TypeError:
+                        cropped = self._ensure_jpeg_compatible(cropped)
+                    except Exception:
+                        cropped = self._ensure_jpeg_compatible(cropped)
+
+                    save_kwargs["quality"] = 95
+                    save_kwargs["subsampling"] = 0
+
+                cropped.save(str(dst_path), **save_kwargs)
+                processed += 1
+                _log("[BATCH] saved OK", str(dst_path))
+
+                # ★ 上書き時は“変更されたパス”を記録してサムネ更新に使う
+                if overwrite:
+                    try:
+                        changed_paths.append(str(dst_path))
+                    except Exception:
+                        pass
+
+                    # 可能なら即 invalidate（サムネ欄の即時反映）
+                    try:
+                        if getattr(self, "model", None):
+                            self.model.invalidate_path(os.path.normpath(str(dst_path)))
+                    except Exception:
+                        pass
+
+                    # ★ 現在表示中の画像が今回上書きされた可能性があるなら、
+                    #    ループ後に1回だけ開き直すフラグを立てる
+                    try:
+                        if getattr(self, "image_path", None):
+                            cur = os.path.normcase(os.path.abspath(self.image_path))
+                            sp  = os.path.normcase(os.path.abspath(str(src)))
+                            dp  = os.path.normcase(os.path.abspath(str(dst_path)))
+                            if cur == sp and sp == dp:
+                                reload_current_after = True
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                errors += 1
+                tb = traceback.format_exc()
+                _log("[BATCH] ERROR:", repr(e))
+                _log(tb)
+                if first_error_text is None:
+                    first_error_text = f"{src}\n{repr(e)}\n{tb}"
+
+        progress.setValue(len(paths))
+
+        # =========================================================
+        # ★ 4.5) 上書き＆同一フォルダ系の“最終即時反映”
+        #        - 現在表示中の画像が対象なら最後に1回だけ開き直す
+        # =========================================================
+        if overwrite and reload_current_after:
+            try:
+                # UI状態を温存して開き直し
+                try:
+                    state = self._snapshot_adjust_state()
+                    if not state:
+                        state = {"rect": "full"}
+                except Exception:
+                    state = {"rect": "full"}
+                self._preserve_ui_on_next_load = state
+
+                self.open_image_from_path(self.image_path)
+            except Exception:
+                pass
+
+        # ---- 結果表示 ----
+        msg = f"一括切り取りが完了しました。\n\n成功: {processed} 件"
+        if errors:
+            msg += f"\nエラー: {errors} 件"
+        QMessageBox.information(self, "一括切り取り", msg)
+
+        if first_error_text:
+            _log("[BATCH] first error detail:\n" + first_error_text)
+
+        _log("[BATCH] ===== batch crop end =====\n")
+
+    def _resolve_batch_save_root(self, src_path: str) -> Path:
+        """
+        一括切り取り時の保存先ルートフォルダを決定する。
+        - 「別フォルダ指定」が有効ならそのフォルダ
+        - それ以外は元画像と同じ場所（zip 内画像は zip ファイルのあるフォルダ）
+        """
+        # まずユーザー指定の保存先（既に save_folder に入れている想定）
+        save_folder = getattr(self, "save_folder", "") or ""
+        save_dest_mode = getattr(self, "save_dest_mode", "same")
+
+        if save_dest_mode != "same" and save_folder:
+            return Path(save_folder).expanduser()
+
+        # zip:// の場合は zip 本体のフォルダを使う
+        if is_zip_uri(src_path):
+            zp, _inner = parse_zip_uri(src_path)
+            return Path(os.path.dirname(zp) or ".").expanduser()
+
+        # 通常ファイル
+        return Path(os.path.dirname(src_path) or ".").expanduser()
+
+    def _build_batch_output_path(self, save_root: Path, src_path: str) -> Path:
+        """
+        元画像の表示名から保存ファイル名を決定する。
+        - 上書きモード ON  : 同名
+        - 上書きモード OFF : name_cropped.png, name_cropped_002.png ... の連番
+        """
+        name = vfs_display_name(src_path, is_dir=False)
+        base, ext = os.path.splitext(name)
+        ext = ext.lower()
+
+        if ext not in (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"):
+            ext = ".png"
+
+        overwrite = getattr(self, "overwrite_mode", False)
+
+        if overwrite:
+            return save_root / f"{base}{ext}"
+
+        # 連番: xxx_cropped.png, xxx_cropped_002.png ...
+        idx = 1
+        while True:
+            if idx == 1:
+                cand = save_root / f"{base}_cropped{ext}"
+            else:
+                cand = save_root / f"{base}_cropped_{idx:03d}{ext}"
+            if not cand.exists():
+                return cand
+            idx += 1
+            if idx > 9999:
+                # さすがに異常なので最後の名前を返して諦める
+                return cand
 
     def on_crop_rect_moved(self, rect):
         self._crop_rect = rect
