@@ -1,5 +1,5 @@
 # gazou_kiritori
-画像切り取りツール。Lora素材作成に使いやすいかも
+画像切り取りツールLora素材作成に使いやすいかも
 
 ドラッグや固定サイズで画像を切り抜き、簡単に保存できます
 
@@ -16,13 +16,26 @@
 　※ パスワード付きファイルには非対応  
 　※ RARの読み込みには外部ツールのインストールが必要（後述）
 - 一括切り取り機能で同じ設定のまま複数画像を自動で切り取り可能（v1.1.1）
+- 背景切り抜き（オプション）（v1.2.0）  
+　※ 使う場合は別途セットアップ（後述）
 
 ## 要件
-- Python(3.12で動作確認済み、たぶん3.10以上であれば動きます)
+
+### アプリ本体
+- Python（3.12で動作確認済み、たぶん3.10以上であれば動きます）
 - Pillow
 - PyQt6
 - rarfile（RAR 対応）
 - py7zr（7z 対応）
+
+### 背景切り抜き（オプション機能）
+- torch（CPU または CUDA 版）
+- torchvision（環境によって必要）
+- numpy
+- transformers
+- timm
+- kornia
+- huggingface_hub（モデルのダウンロード/キャッシュに使用）
 
 ## インストール手順
 1. このリポジトリを任意のフォルダにクローンまたはzipダウンロード
@@ -31,12 +44,10 @@
 git clone https://github.com/99a-bc/gazou_kiritori.git
 ```
 
-2. `install.bat`をダブルクリック
-
+2. `install_app.bat`をダブルクリック
 
 ## 起動方法
-- `run_gazou_kiritori.bat`をダブルクリック
-
+- `run_gazou_kiritori.bat` をダブルクリック
 
 ## 使い方
 1. メニューバー上部のファイル→画像を開く or 画像やフォルダ、圧縮ファイルをドラッグ&ドロップ
@@ -64,6 +75,74 @@ RAR を扱いたい場合は以下のソフトをインストールし、コマ�
 7-Zip
 
 インストール後、システム環境変数のPathを通してください
+
+
+
+## 背景切り抜き（オプション機能） 
+
+<p>画像の背景を切り抜くことができます</p>
+<table>
+  <tr>
+    <td><img src="images/screenshot_cutout1.png" width="300"></td>
+    <td style="vertical-align: middle; text-align: center; font-size: 28px; padding: 0 12px;">→</td>
+    <td><img src="images/screenshot_cutout2.png" width="300"></td>
+  </tr>
+</table>　　
+
+
+<p>選択した範囲のみを切り抜くことも可能です</p>
+
+<table>
+  <tr>
+    <td><img src="images/screenshot_cutout3.png" width="300"></td>
+    <td style="vertical-align: middle; text-align: center; font-size: 28px; padding: 0 12px;">→</td>
+    <td><img src="images/screenshot_cutout4.png" width="300"></td>
+  </tr>
+</table>　　
+　　
+
+背景切り抜き機能を使う場合だけ、以下を実行してください
+
+※重要：本機能で導入する RMBG v1.4 / v2.0 は **非商用利用のみ** です  
+**商用目的（収益化、業務利用、製品/サービスへの組み込み等）では利用できません**  
+（商用利用したい場合は提供元の商用ライセンス/別契約が必要になります）
+
+### 1) 背景切り抜き用の依存関係を入れる（CPU / GPU 選択）
+`enable_bg.bat` を実行します  途中で CPU / GPU（cu128 など）を選択できます。GPUを使用する場合は自身の環境に合わせてcu***を選択してください
+
+- 既に torch が入っている場合でも、選択したモードに合わせて入れ直します（CPU ↔ GPU の切り替えを想定）
+
+### 2) 使いたいモデルをインストールする（※非商用利用のみ）
+モデルはアプリ配下の `.\hf_home\hub\` にキャッシュされます
+
+- RMBG v1.4を入れる → `install_rmbg_1_4.bat`
+
+- RMBG v2.0を入れる  
+  v2.0 は Hugging Face 側で **アクセス許可/承諾** と **ログイン（Access Token）** が必須です  
+  **必ず先に** 以下を実行してから `install_rmbg_2_0.bat` を実行してください
+
+  1. Hugging Face にログインし、 [`briaai/RMBG-2.0`](https://huggingface.co/briaai/RMBG-2.0) を開く
+
+  2. モデルのアクセス許可（承諾）を行う  
+     - ページ上に「Access」「Agree」「Request access」等の表示がある場合は、案内に従って承諾してください  
+     - 承諾が完了していないと、`install_rmbg_2_0.bat` 実行時に 401 / GatedRepoError で失敗します
+
+  3. Access Token を作成する（Hugging Face）  
+     1) 右上のアカウントアイコン → **Settings**  
+     2) 左メニューの **Access Tokens**  
+     3) **New token**（Create new token）  
+     4) 権限（Role）は **Read** を選択して作成  
+     5) 表示されたトークン文字列をコピー（※基本的に表示は1回だけなので注意してください。保存し忘れた場合は、そのトークンを無効化（revoke）して新しく作り直してください）
+
+  4. `hf_login_visible_sjis.bat` を実行して Access Token を登録  
+
+  5. `install_rmbg_2_0.bat` を実行
+
+### 3) アプリ側の挙動
+- 背景切り抜きモデルが1つも入っていない場合、背景切り抜きボタンはグレーアウトします  
+<img src="images/screenshot_cutoutbutton_geyout.png" width="70">  
+- 1つ以上モデルが入っている場合ボタンが有効になり、右クリックでモデル選択ができます（未インストールのモデルはグレーアウトします）  
+<img src="images/screenshot_cutoutbutton_menu.png" width="500">  
 
 ## 便利機能
 
@@ -113,13 +192,25 @@ RAR を扱いたい場合は以下のソフトをインストールし、コマ�
 
 ## その他
 
-本アプリはフルスクリーン前提で作成しています  
-ウインドウ状態でも動作はしますが、レイアウトなどは考慮していないため、フルスクリーンでの利用をお勧めします
+- 本アプリはフルスクリーン前提で作成しています  
+  ウインドウ状態でも動作はしますが、レイアウトなどは考慮していないため、フルスクリーンでの利用をお勧めします
 
+- 背景切り抜き機能（RMBG）はオプションです  
+  モデル本体は本リポジトリに同梱していないため、READMEの手順に従って別途インストールしてください
 
-本アプリの一部アイコンは [Tabler Icons](https://tablericons.com/) を使用しています（MIT License）
+- 背景切り抜き機能で GPU を使用する場合は NVIDIA ドライバが必要です  
+  `enable_bg.bat` で環境に合う cu*** を選択してください（うまく動かない場合は CPU を選択してください）  
+  ※通常の画像切り取り機能（矩形切り抜き等）では GPU は使用しません
+
+- 本アプリの一部アイコンは [Tabler Icons](https://tablericons.com/) を使用しています（MIT License）
+
+- 本アプリの利用により生じたいかなる損害についても作者は責任を負いません  
+  自己責任で利用してください
 
 ## 変更履歴
+
+### v1.2.0
+- 背景切り抜き機能追加
 
 ### v1.1.1
 - 一括切り取り機能追加

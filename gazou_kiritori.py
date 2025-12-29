@@ -5,28 +5,39 @@ import re
 import math
 import traceback
 import time
-from io import BytesIO
-import os, tempfile
+import tempfile
 import subprocess
 from pathlib import Path
+from io import BytesIO
 
-
-# ===== third-party =====
-from PIL.ImageQt import ImageQt
-from PIL import Image, ImageOps
+# ===== torch preload (MUST be before any Qt import) =====
+try:
+    import torch
+    print("[preload] torch OK:", torch.__version__)
+except Exception as e:
+    print("[preload] torch preload failed:", repr(e))
 
 # ===== PyQt6 =====
 from PyQt6 import QtCore, QtGui, QtWidgets
-
 from PyQt6.QtGui import QAction, QActionGroup, QShortcut, QKeySequence
 from PyQt6.QtCore import QPoint, QSignalBlocker
-from PyQt6.QtWidgets import QSizePolicy, QMessageBox
-from PyQt6.QtWidgets import QDialogButtonBox
+from PyQt6.QtWidgets import QSizePolicy, QMessageBox, QDialogButtonBox
+
+# ===== third-party (PIL) =====
+from PIL import Image, ImageOps
+from PIL.ImageQt import ImageQt  # ← ここに移動（Qt import 後でOK）
+
+# ===== Background removal (optional) =====
+try:
+    from background_removal import BackgroundRemovalManager, get_available_bg_models
+except Exception:
+    BackgroundRemovalManager = None  # type: ignore[assignment]
+    def get_available_bg_models():
+        return {}
 
 # ===== VFS (zip / rar / 7z) helpers: メモリ展開のみ／tempは使わない =====
 import zipfile
 from functools import lru_cache
-from io import BytesIO
 
 # RAR 対応（rarfile が無ければ None のまま）
 try:
@@ -41,7 +52,7 @@ except Exception:
     py7zr = None
 
 APP_NAME = "画像切り取りツール"
-APP_VERSION = "1.1.1" 
+APP_VERSION = "1.2.0" 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
@@ -2075,19 +2086,46 @@ class MovableNudgePanel(NudgePanel):
             pass
 
 class OptionsDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None, *, overwrite=False, thumb_scroll_step=24, hq_zoom=False):
+    def __init__(
+        self,
+        parent=None,
+        *,
+        overwrite=False,
+        thumb_scroll_step=24,
+        hq_zoom=False,
+        alpha_output_format="png",   # 追加：透過時の出力形式
+    ):
         super().__init__(parent)
         self.setWindowTitle("設定")
         self.setModal(True)
 
-        # 設定ダイアログからは保存方式を操作しないため、元の値だけ保持
-        self._orig_overwrite_mode   = bool(overwrite)
+        # 設定ダイアログからは保存方式(上書き/連番)を操作しないため、元の値だけ保持
+        self._orig_overwrite_mode = bool(overwrite)
 
         v = QtWidgets.QVBoxLayout(self)
 
-        # --- 保存（チェック一つだけ残す） ---
+        # --- 保存 ---
         grp_save = QtWidgets.QGroupBox("保存")
         gsave = QtWidgets.QVBoxLayout(grp_save)
+
+        # 透過時の保存形式（PNG / WebP）
+        row_alpha = QtWidgets.QHBoxLayout()
+        lbl_alpha = QtWidgets.QLabel("透過がある場合の保存形式")
+        self.cmb_alpha_output_format = QtWidgets.QComboBox()
+        self.cmb_alpha_output_format.addItem("PNG", "png")
+        self.cmb_alpha_output_format.addItem("WebP", "webp")
+
+        # 初期値
+        fmt = str(alpha_output_format).lower()
+        if fmt not in ("png", "webp"):
+            fmt = "png"
+        idx = self.cmb_alpha_output_format.findData(fmt)
+        if idx >= 0:
+            self.cmb_alpha_output_format.setCurrentIndex(idx)
+
+        row_alpha.addWidget(lbl_alpha)
+        row_alpha.addWidget(self.cmb_alpha_output_format, 1)
+        gsave.addLayout(row_alpha)
 
         self.chk_prompt_save_on_load = QtWidgets.QCheckBox("読み込み時に保存先ダイアログを表示")
         # 初期値は open_options_dialog 側で注入されるのでここでは仮値
@@ -2123,14 +2161,14 @@ class OptionsDialog(QtWidgets.QDialog):
         v.addWidget(btns)
 
     def values(self) -> dict:
-        # overwrite_* は“元の値のまま”返す（設定ダイアログでは変更しない）
         return {
             "overwrite_mode": self._orig_overwrite_mode,
             "thumb_scroll_step": self.spin_thumb_step.value(),
             "hq_zoom": self.chk_hq_zoom.isChecked(),
             "show_save_dialog_on_load": self.chk_prompt_save_on_load.isChecked(),
+            "alpha_output_format": self.cmb_alpha_output_format.currentData(),  # 追加
         }
-
+    
 class SaveDestinationDialog(QtWidgets.QDialog):
     """
     画像/フォルダ読み込み直後に表示する保存先ダイアログ。
@@ -4807,6 +4845,11 @@ class CropperApp(QtWidgets.QMainWindow):
         # ★ ループ状態を設定から復元（なければ False）
         self._thumb_loop_enabled = bool(self.settings.value("thumb_loop_enabled", False, type=bool))
 
+
+        self.alpha_output_format = self.settings.value("alpha_output_format", "png", type=str).lower()
+        if self.alpha_output_format not in ("png", "webp"):
+            self.alpha_output_format = "png"
+
         # --- DnD後の保存先ダイアログ遅延用フラグ（Explorerフリーズ回避） ---
         self._defer_save_dialog_once = False   # ← ここに追加
 
@@ -4829,12 +4872,25 @@ class CropperApp(QtWidgets.QMainWindow):
             if c3.isValid():
                 self.view_bg_color = c3
         
+
+        # --- 透過チェック背景：市松（設定から復元） ---
+        self.checker_bg_enabled = bool(self.settings.value("checker_bg_enabled", False, type=bool))
+        # 市松ブラシのキャッシュ（必要になったら _get_checker_brush が作る）
+        self._checker_brush_preview = None
+        self._checker_brush_view = None
+
         # （色チップを使っているなら初期表示も保存色で）
         if hasattr(self, "preview_color_chip"):
             self.preview_color_chip.setStyleSheet(
                 f"background:{self.preview_bg_color.name(QtGui.QColor.NameFormat.HexArgb)}; "
                 "border:1px solid #666; border-radius:3px;"
             )
+
+        # --- 背景切り抜きモデル（起動時はまだ作らない。ボタン押下時に遅延初期化） ---
+        self.bg_manager = None
+        self.bg_model_key = str(self.settings.value("bg_model_key", "bria_rmbg_1_4", type=str))
+
+        self._ensure_bg_model_key_valid()
 
         self.setAcceptDrops(True)
 
@@ -4947,18 +5003,18 @@ class CropperApp(QtWidgets.QMainWindow):
         QPushButton {
             background:#2b2b2b;
             color:#e0e0e0;
-            border:2px solid #e6c15a;
+            border:2px solid #e6c15a;      /* ← 黄色っぽい外枠 */
             border-radius:10px;
             padding:0px;
             font-size: 11pt;
         }
         QPushButton:hover  {
-            background:#333333;
-            border-color:#f4e38a;
+            background:#454545;        /* ← ちょっと明るく */
+            border-color:#ffe58a;      /* ← 枠ももう一段明るく */
         }
         QPushButton:pressed{
             background:#222222;
-            border-color:#cfa744;
+            border-color:#cfa744;          /* 押したとき少し濃く */
         }
         """)
         self.btn_flip_vertical.clicked.connect(self.on_flip_vertical)
@@ -4987,6 +5043,43 @@ class CropperApp(QtWidgets.QMainWindow):
         self.btn_pick_view.setMinimumHeight(26)
         self.btn_pick_view.setStyleSheet(self.btn_pick_bg.styleSheet())
     
+
+        # ★ 透過チェック背景（市松）トグル
+        self.btn_checker_bg = QtWidgets.QToolButton()
+        self.btn_checker_bg.setToolTip("透過背景の市松模様を表示/非表示")
+        self.btn_checker_bg.setCheckable(True)
+        self.btn_checker_bg.setChecked(bool(getattr(self, "checker_bg_enabled", False)))
+        self.btn_checker_bg.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.btn_checker_bg.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.btn_checker_bg.setFixedSize(28, 18)
+
+        # ★ 文字は出さない（アイコンのみ）
+        self.btn_checker_bg.setText("")
+        self.btn_checker_bg.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonIconOnly)
+
+        # ★ 市松アイコンを設定（※ _make_checker_icon をクラス内に追加済み前提）
+        self.btn_checker_bg.setIcon(self._make_checker_icon(w=24, h=14, tile=3))
+        self.btn_checker_bg.setIconSize(QtCore.QSize(24, 14))
+
+        # ★ 見た目（checked時は枠で分かる）
+        self.btn_checker_bg.setStyleSheet("""
+        QToolButton {
+            background:#2b2b2b;
+            border:0px;
+            border-radius:6px;
+            padding:0px;
+        }
+        QToolButton:hover  {
+            background:#2b2b2b;                         /* 背景は据え置き */
+            border:2px solid rgba(167,131,255,0.90);    /* 明るい紫リング */
+        }
+        QToolButton:checked{
+            background:#2b2b2b;
+            border:2px solid #6f3cff;                 /* ON時の紫枠は維持 */
+        }
+        """)
+        self.btn_checker_bg.toggled.connect(self._on_checker_bg_toggled)
+
         # 完全に“飾り”にする
         for b in (self.btn_pick_bg, self.btn_pick_view):
             b.setEnabled(False)  # クリック不可＆キーボードもフォーカスしない
@@ -5140,6 +5233,11 @@ class CropperApp(QtWidgets.QMainWindow):
         prev_col.addLayout(chip_row_prev)
 
         # 左側：色チップ 2列（プレビュー/画像表示）
+        mid_col = QtWidgets.QVBoxLayout()
+        mid_col.setSpacing(0)
+        mid_col.addSpacing(self.btn_pick_bg.minimumHeight() + 4)  # ←「ボタン1個分下」(26+spacing4)
+        mid_col.addWidget(self.btn_checker_bg, alignment=QtCore.Qt.AlignmentFlag.AlignHCenter)
+
         row = QtWidgets.QHBoxLayout()
         row.addLayout(prev_col)
         row.addSpacing(12)
@@ -5294,12 +5392,40 @@ class CropperApp(QtWidgets.QMainWindow):
         
         # 左の色チップ列を一旦ウィジェット化
         left = QtWidgets.QWidget()
-        left.setLayout(row)
+
+        left_outer = QtWidgets.QVBoxLayout(left)
+        left_outer.setContentsMargins(0, 0, 0, 0)
+        left_outer.setSpacing(0)
+
+        left_outer.addLayout(row)      # ← タイトル＋チップ列（ここは今まで通り）
+        left_outer.addStretch(1)       # ← ★余白は全部「下」に集める
+
+        # ★ 市松ボタンはレイアウトに入れず、left上に重ねて配置する
+        self.btn_checker_bg.setParent(left)
+        self.btn_checker_bg.raise_()
+        self._bg_color_left_widget = left  # 位置計算用に保持
+
+        # left のリサイズ/表示タイミングで再配置するイベントフィルタ
+        class _CheckerOverlayPosFilter(QtCore.QObject):
+            def __init__(self, owner):
+                super().__init__(owner)
+                self._owner = owner
+
+            def eventFilter(self, obj, ev):
+                t = ev.type()
+                if t in (QtCore.QEvent.Type.Show, QtCore.QEvent.Type.Resize, QtCore.QEvent.Type.LayoutRequest):
+                    QtCore.QTimer.singleShot(0, self._owner._reposition_checker_bg_button)
+                return False
+
+        self._checker_overlay_filter = _CheckerOverlayPosFilter(self)
+        left.installEventFilter(self._checker_overlay_filter)
+
+        QtCore.QTimer.singleShot(0, self._reposition_checker_bg_button)
 
         # 「色チップ列」＋「保存方法」＋「保存先」を横並びで包む
         row_widget = QtWidgets.QWidget()
         wrap = QtWidgets.QHBoxLayout(row_widget)
-        wrap.setContentsMargins(0, 0, 0, 0)
+        wrap.setContentsMargins(0, 13, 0, 0)
         wrap.setSpacing(16)
         wrap.addWidget(left)
         wrap.addStretch(1)
@@ -5347,28 +5473,69 @@ class CropperApp(QtWidgets.QMainWindow):
         self.btn_batch_crop.setCursor(
             QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         )
-
-        # ★ 一括切り取りだけ紫枠にする
         self.btn_batch_crop.setStyleSheet("""
         QPushButton {
             background:#2b2b2b;
             color:#e0e0e0;
-            border:2px solid #b36bff;      /* ← 紫の外枠 */
+            border:2px solid #ff5fbf;      /* ← ピンク */
             border-radius:10px;
             padding:0px;
             font-size: 11pt;
         }
         QPushButton:hover  {
             background:#454545;
-            border-color:#d7adff;
+            border-color:#ff93d7;          /* ← 少し明るいピンク */
         }
         QPushButton:pressed{
             background:#222222;
-            border-color:#8f3dff;
+            border-color:#ff2fa8;          /* ← 濃いピンク */
+        }
+        """)
+        self.btn_batch_crop.clicked.connect(self.on_batch_crop_clicked)
+
+        # ★ 背景切り抜きボタン
+        self.btn_bg_remove = QtWidgets.QPushButton("背景\n切り抜き")
+        self.btn_bg_remove.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.btn_bg_remove.setFixedSize(72, 72)
+        self.btn_bg_remove.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self.btn_bg_remove.setCursor(
+            QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        )
+        self.btn_bg_remove.setStyleSheet("""
+        QPushButton {
+            background:#2b2338;
+            color:#f0e8ff;
+            border:2px solid #8a5cff;      /* 通常時の紫 */
+            border-radius:10px;
+            padding:0px;
+            font-size: 11pt;
+        }
+        QPushButton:hover  {
+            background:#3a2a4a;
+            border-color:#b08aff;          /* 少し明るい紫 */
+        }
+        QPushButton:pressed{
+            background:#221a33;
+            border-color:#7a4bf5;          /* ちょい濃い紫 */
+        }
+        QPushButton:disabled {
+            background:#1f1a28;            /* ちょっと暗めに */
+            color:#777777;                 /* 文字もグレー寄り */
+            border:2px solid #4f3a80;      /* 元の紫を暗くした感じ */
         }
         """)
 
-        self.btn_batch_crop.clicked.connect(self.on_batch_crop_clicked)
+        self.btn_bg_remove.clicked.connect(self.remove_background_on_current_image)
+
+        # モデルが無いなら押せないようにする（ツールチップもここで管理）
+        self._update_bg_remove_button_enabled()
+
+        # 右クリックでモデル選択
+        self._install_bg_model_context_menu_on_button()
+
 
         # 左：水平反転ボタン
         flip_row.addWidget(
@@ -5394,6 +5561,13 @@ class CropperApp(QtWidgets.QMainWindow):
         # ★ 一括切り取りボタン
         flip_row.addWidget(
             self.btn_batch_crop,
+            0,
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignBottom
+        )
+
+        # ★ 背景切り抜きボタン（←一括切り取りの右横）
+        flip_row.addWidget(
+            self.btn_bg_remove,
             0,
             QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignBottom
         )
@@ -5761,6 +5935,7 @@ class CropperApp(QtWidgets.QMainWindow):
 
         menubar = self.menuBar()
         file_menu = menubar.addMenu("ファイル")
+        #self._install_bg_model_menu(menubar)
         open_action = file_menu.addAction("画像を開く")
         open_action.triggered.connect(self.open_image)
         file_menu.addSeparator()
@@ -6516,6 +6691,7 @@ class CropperApp(QtWidgets.QMainWindow):
             overwrite=self.overwrite_mode,
             thumb_scroll_step=self.thumb_scroll_step,
             hq_zoom=self.hq_zoom,
+            alpha_output_format=getattr(self, "alpha_output_format", "png"),  # 追加
             # ← ここに prompt_save_on_load は渡さない
         )
 
@@ -6532,11 +6708,17 @@ class CropperApp(QtWidgets.QMainWindow):
             self.hq_zoom           = bool(vals["hq_zoom"])
             self.show_save_dialog_on_load = bool(vals["show_save_dialog_on_load"])
 
+            # ★ 透過時の出力形式
+            self.alpha_output_format = str(vals.get("alpha_output_format", "png")).lower()
+            if self.alpha_output_format not in ("png", "webp"):
+                self.alpha_output_format = "png"
+
             # 保存
             self.settings.setValue("overwrite_mode", self.overwrite_mode)
             self.settings.setValue("thumb_scroll_step", self.thumb_scroll_step)
             self.settings.setValue("hq_zoom", self.hq_zoom)
             self.settings.setValue("show_save_dialog_on_load", self.show_save_dialog_on_load)
+            self.settings.setValue("alpha_output_format", self.alpha_output_format)  # 追加
 
             # メニューのチェックも同期
             try:
@@ -9214,6 +9396,78 @@ class CropperApp(QtWidgets.QMainWindow):
                 QtCore.Qt.TransformationMode.SmoothTransformation
             )
 
+    def _checker_colors(self) -> tuple[QtGui.QColor, QtGui.QColor]:
+        # 市松の2色（ボタンアイコン／プレビュー／メイン表示で共通）
+        return QtGui.QColor("#EDEDED"), QtGui.QColor("#C0C0C0")  # 白・黒
+
+    def _get_checker_brush(self, which: str = "preview") -> QtGui.QBrush:
+        """
+        透過チェック用の市松ブラシを返す（キャッシュ付き）
+        which: "preview" or "view"
+        """
+        attr = "_checker_brush_preview" if which == "preview" else "_checker_brush_view"
+        b = getattr(self, attr, None)
+        if b is not None:
+            return b
+
+        tile = 12  # 市松1マスの1辺(px)
+        pix = QtGui.QPixmap(tile * 2, tile * 2)
+
+        c1, c2 = self._checker_colors()  # ★共通色
+        pix.fill(c1)
+
+        p = QtGui.QPainter(pix)
+        try:
+            p.fillRect(0, 0, tile, tile, c2)
+            p.fillRect(tile, tile, tile, tile, c2)
+        finally:
+            p.end()
+
+        b = QtGui.QBrush(pix)
+        b.setStyle(QtCore.Qt.BrushStyle.TexturePattern)
+
+        setattr(self, attr, b)
+        return b
+
+
+    def _make_checker_icon(self, w: int = 40, h: int = 22, tile: int = 5) -> QtGui.QIcon:
+        """
+        市松模様のアイコンを生成
+        """
+        pm = QtGui.QPixmap(w, h)
+        pm.fill(QtCore.Qt.GlobalColor.transparent)
+
+        c1, c2 = self._checker_colors()  # ★共通色
+
+        radius = 4
+        p = QtGui.QPainter(pm)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+
+        # 角丸クリップ
+        path = QtGui.QPainterPath()
+        path.addRoundedRect(QtCore.QRectF(0.5, 0.5, w - 1.0, h - 1.0), radius, radius)
+        p.setClipPath(path)
+
+        # ベース
+        p.fillRect(0, 0, w, h, c1)
+
+        # 市松
+        for y in range(0, h, tile):
+            for x in range(0, w, tile):
+                if ((x // tile) + (y // tile)) % 2 == 0:
+                    p.fillRect(x, y, tile, tile, c2)
+
+        # 枠線
+        p.setClipping(False)
+        pen = QtGui.QPen(QtGui.QColor(0, 0, 0, 90))
+        pen.setWidth(1)
+        p.setPen(pen)
+        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QtCore.QRectF(0.5, 0.5, w - 1.0, h - 1.0), radius, radius)
+
+        p.end()
+        return QtGui.QIcon(pm)
+
     def show_image(self):
         if self.image is None:
             return
@@ -9232,43 +9486,105 @@ class CropperApp(QtWidgets.QMainWindow):
             self._scaled_pixmap = None
             self._scaled_key = None
 
+        # --- ★ 画像サイズが変わったら「ズーム基準」を捨てる（矩形変形対策） ---
+        # トリミング/回転などで self.image のサイズが変わると、古い base_display_* が残ってズレる
+        try:
+            sig = (int(self.img_pixmap.width()), int(self.img_pixmap.height()))
+            if getattr(self, "_base_display_img_sig", None) != sig:
+                # ズーム基準を破棄
+                self.base_display_width = None
+                self.base_display_height = None
+
+                # 拡大済みキャッシュも破棄（古い基準サイズの scaled を使い回さない）
+                self._scaled_pixmap = None
+                self._scaled_key = None
+
+                # パン/表示領域も初期化（新サイズだと範囲外になり得る）
+                if hasattr(self, "label") and self.label is not None:
+                    self.label._pan_offset_x = 0
+                    self.label._pan_offset_y = 0
+                    self.label._view_rect_scaled = QtCore.QRect()
+
+            self._base_display_img_sig = sig
+        except Exception:
+            pass
+
         label_w, label_h = self.label.width(), self.label.height()
         img_w, img_h = self.img_pixmap.width(), self.img_pixmap.height()
 
-        if self.zoom_scale == 1.0 or self.base_display_width is None or self.base_display_height is None:
-            # 初期フィット時のみスケール（滑らかでOK、頻度が低い）
+        # ★ label サイズが変わった（フルスクリーン/リサイズ等）なら、
+        #   「ズーム基準（base_display_*）」を現在の label に合わせて更新する
+        cur_lbl = (int(label_w), int(label_h))
+        prev_lbl = getattr(self, "_last_main_label_size", None)
+        if prev_lbl != cur_lbl:
+            self._last_main_label_size = cur_lbl
+
+            # フィット時の基準サイズを再計算（ズーム倍率はそのまま活かす）
+            fitted_size = QtCore.QSize(int(img_w), int(img_h))
+            fitted_size.scale(int(label_w), int(label_h), QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+            self.base_display_width  = int(fitted_size.width())
+            self.base_display_height = int(fitted_size.height())
+
+            # キャッシュは基準サイズが変わるので破棄
+            self._scaled_pixmap = None
+            self._scaled_key = None
+
+        # --- 0) base_display_* が未確定なら「まず確定」する（ズーム中でもここはやる） ---
+        if self.base_display_width is None or self.base_display_height is None:
+            # 初期フィット（滑らかでOK、頻度が低い）
             if img_w <= label_w and img_h <= label_h:
-                scaled = self.img_pixmap
+                base_scaled = self.img_pixmap
             else:
-                scaled = self.img_pixmap.scaled(
+                base_scaled = self.img_pixmap.scaled(
                     label_w, label_h,
                     QtCore.Qt.AspectRatioMode.KeepAspectRatio,
                     QtCore.Qt.TransformationMode.SmoothTransformation
                 )
-            self.base_display_width  = scaled.width()
-            self.base_display_height = scaled.height()
 
-            # ★ ズーム=1.0のときの拡大済みキャッシュとして保持
-            self._scaled_pixmap = scaled
-            self._scaled_key = (int(self.img_pixmap.cacheKey()),
-                                self.base_display_width, self.base_display_height,
-                                1.0, False)  # ← hqフラグを含める
+            self.base_display_width = base_scaled.width()
+            self.base_display_height = base_scaled.height()
 
-            # 表示は全域
+            # ズーム=1.0 のキャッシュとして保持
+            self._scaled_pixmap = base_scaled
+            self._scaled_key = (
+                int(self.img_pixmap.cacheKey()),
+                self.base_display_width, self.base_display_height,
+                1.0, False
+            )
+
+        # --- 1) 表示（ズーム=1 とズーム中で分岐） ---
+        if self.zoom_scale == 1.0:
+            # ズーム=1.0 はキャッシュ一致ならそれを使う（不一致なら作り直す）
+            base_key = int(self.img_pixmap.cacheKey())
+            key_now = (base_key, self.base_display_width, self.base_display_height, 1.0, False)
+
+            if self._scaled_pixmap is None or self._scaled_key != key_now:
+                if img_w <= label_w and img_h <= label_h:
+                    self._scaled_pixmap = self.img_pixmap
+                else:
+                    self._scaled_pixmap = self.img_pixmap.scaled(
+                        label_w, label_h,
+                        QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                        QtCore.Qt.TransformationMode.SmoothTransformation
+                    )
+                self._scaled_key = key_now
+
+            scaled = self._scaled_pixmap
             self.label._view_rect_scaled = QtCore.QRect(0, 0, scaled.width(), scaled.height())
             display_pixmap = scaled
 
         else:
             # --- 2) ズーム時：拡大済みキャッシュを使い回す ---
-            target_w = int(self.base_display_width  * self.zoom_scale)
+            target_w = int(self.base_display_width * self.zoom_scale)
             target_h = int(self.base_display_height * self.zoom_scale)
-            target_w = max(1, target_w); target_h = max(1, target_h)
+            target_w = max(1, target_w)
+            target_h = max(1, target_h)
 
             need_rebuild = True
             base_key = int(self.img_pixmap.cacheKey())
             hq = bool(getattr(self, "hq_zoom", False))
-            key_now = (base_key, self.base_display_width, self.base_display_height,
-                    float(self.zoom_scale), hq)
+            key_now = (base_key, self.base_display_width, self.base_display_height, float(self.zoom_scale), hq)
+
             if self._scaled_pixmap is not None and self._scaled_key == key_now:
                 need_rebuild = False
 
@@ -9283,7 +9599,8 @@ class CropperApp(QtWidgets.QMainWindow):
                         QtCore.Qt.AspectRatioMode.KeepAspectRatio,
                         QtCore.Qt.TransformationMode.SmoothTransformation
                     )
-            self._scaled_key = key_now
+                self._scaled_key = key_now
+
             scaled = self._scaled_pixmap
 
             # ここからは「表示領域の切り出し」だけ（安い）
@@ -9300,7 +9617,17 @@ class CropperApp(QtWidgets.QMainWindow):
             # ★ ここでは「copy」だけ。再スケールはしない
             display_pixmap = scaled.copy(crop_rect)
 
+        # ★ 市松ONなら、表示用のピクスマップに市松を合成してから貼る
+        if bool(getattr(self, "checker_bg_enabled", False)):
+            composed = QtGui.QPixmap(display_pixmap.size())
+            p = QtGui.QPainter(composed)
+            p.fillRect(composed.rect(), self._get_checker_brush("view"))
+            p.drawPixmap(0, 0, display_pixmap)
+            p.end()
+            display_pixmap = composed
+
         self.label.setPixmap(display_pixmap)
+
         # センタリング用のオフセットを更新（既存ロジック流用）
         lw, lh = self.label.width(), self.label.height()
         pw, ph = display_pixmap.width(), display_pixmap.height()
@@ -9314,8 +9641,8 @@ class CropperApp(QtWidgets.QMainWindow):
         # デバッグ
         vr = getattr(self.label, "_view_rect_scaled", None)
         if DEBUG_VIEW_RECT and vr:
-            log_debug(f"[VIEW_RECT] x={vr.x()} y={vr.y()} w={vr.width()} h={vr.height()}")
-        
+            log_debug(f"[VIEW_RECT] x={vr.x()} y={vr.y()} w={vr.width()} h={vr.height()} ")
+
     def update_preview(self, crop_rect=None):
         try:
             # ベース確保（画像が切り替わったら自動更新）
@@ -9345,6 +9672,7 @@ class CropperApp(QtWidgets.QMainWindow):
                 getattr(self.preview_label, "width",  lambda:512)() or 512,
                 getattr(self.preview_label, "height", lambda:512)() or 512
             ))
+
             sub = self._preview_base_pixmap.copy(r)
             fitted = sub.scaled(
                 PREVIEW_MAX, PREVIEW_MAX,
@@ -9353,18 +9681,35 @@ class CropperApp(QtWidgets.QMainWindow):
             )
 
             canvas = QtGui.QPixmap(PREVIEW_MAX, PREVIEW_MAX)
-            canvas.fill(getattr(self, "preview_bg_color", QtGui.QColor(255, 255, 255)))
-            p = QtGui.QPainter(canvas)
-            p.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True) 
-            p.drawPixmap((PREVIEW_MAX - fitted.width()) // 2,
-                        (PREVIEW_MAX - fitted.height()) // 2,
-                        fitted)
-            p.end()
+            p = None
+            try:
+                p = QtGui.QPainter(canvas)
+
+                # ★ 市松ONなら「キャンバスに市松を描く」→その上に画像
+                if bool(getattr(self, "checker_bg_enabled", False)):
+                    p.fillRect(canvas.rect(), self._get_checker_brush("preview"))
+                else:
+                    c = getattr(self, "preview_bg_color", QtGui.QColor(255, 255, 255))
+                    p.fillRect(canvas.rect(), QtGui.QBrush(c))
+
+                p.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
+                p.drawPixmap(
+                    (PREVIEW_MAX - fitted.width()) // 2,
+                    (PREVIEW_MAX - fitted.height()) // 2,
+                    fitted
+                )
+            finally:
+                if p is not None:
+                    p.end()
 
             self.preview_label.setPixmap(canvas)
 
-        except Exception:
-            self._set_preview_placeholder()
+        except Exception as e:
+            log_debug(f"[preview] update_preview failed: {e}")
+            try:
+                self._set_preview_placeholder()
+            except Exception:
+                pass
             
     def _ensure_preview_base(self):
         if not getattr(self, "img_pixmap", None):
@@ -9402,7 +9747,18 @@ class CropperApp(QtWidgets.QMainWindow):
     def _set_preview_placeholder(self):
         side = 384 if getattr(self, "_preview_initial_cap", False) else getattr(self.preview_label, "_base_side", 512)
         pm = QtGui.QPixmap(side, side)
-        pm.fill(getattr(self, "preview_bg_color", QtGui.QColor(255, 255, 255)))
+
+        if bool(getattr(self, "checker_bg_enabled", False)):
+            # 市松ON：プレースホルダも市松で塗る
+            pm.fill(QtCore.Qt.GlobalColor.transparent)
+            p = QtGui.QPainter(pm)
+            try:
+                p.fillRect(pm.rect(), self._get_checker_brush("preview"))
+            finally:
+                p.end()
+        else:
+            pm.fill(getattr(self, "preview_bg_color", QtGui.QColor(255, 255, 255)))
+
         self.preview_label.setPixmap(pm)
     
     def _apply_preview_bg_to_label(self):
@@ -9455,6 +9811,71 @@ class CropperApp(QtWidgets.QMainWindow):
         self.label.setStyleSheet(
             f"background: {name}; border: 2px solid #f28524; border-radius: 12px;"
         )
+
+    # ============================================================
+    # Checkerboard background (透明チェック / 市松)
+    # ============================================================
+    def _on_checker_bg_toggled(self, on: bool):
+        """市松背景のON/OFF（プレビューとメイン表示に反映 + 設定へ保存）"""
+        self.checker_bg_enabled = bool(on)
+        try:
+            self.settings.setValue("checker_bg_enabled", bool(on))
+        except Exception:
+            pass
+
+        # ブラシは必要になったら作り直す
+        try:
+            self._checker_brush_preview = None
+            self._checker_brush_view = None
+        except Exception:
+            pass
+
+        # 表示更新
+        try:
+            # プレビュー：最後の矩形があればそれ、なければプレースホルダ
+            rect = getattr(self, "_crop_rect_img", None)
+            self.update_preview(rect)
+        except Exception:
+            pass
+        try:
+            self.show_image()
+        except Exception:
+            pass
+
+    def _reposition_checker_bg_button(self):
+        btn = getattr(self, "btn_checker_bg", None)
+        left = getattr(self, "_bg_color_left_widget", None)
+        if btn is None or left is None or btn.parentWidget() is not left:
+            return
+
+        lay = left.layout()
+        if lay:
+            lay.activate()
+
+        DROP_PX = 24  # ← ここだけ増やせば下がる（タイトル周りは動かない）
+
+        try:
+            pr = self.preview_chip_q2.mapTo(left, QtCore.QPoint(self.preview_chip_q2.rect().right(),
+                                                                self.preview_chip_q2.rect().center().y())).x()
+            vl = self.view_chip_current.mapTo(left, QtCore.QPoint(self.view_chip_current.rect().left(),
+                                                                self.view_chip_current.rect().center().y())).x()
+            x_center = (pr + vl) // 2
+
+            p_bottom = self.preview_chip_q2.mapTo(left, QtCore.QPoint(0, self.preview_chip_q2.rect().bottom())).y()
+            v_bottom = self.view_chip_q2.mapTo(left, QtCore.QPoint(0, self.view_chip_q2.rect().bottom())).y()
+            y = max(p_bottom, v_bottom) + DROP_PX
+
+            x = int(x_center - btn.width() / 2)
+
+        except Exception:
+            r1 = self.btn_pick_bg.geometry()
+            r2 = self.btn_pick_view.geometry()
+            x = int(((r1.center().x() + r2.center().x()) / 2) - btn.width() / 2)
+            y = int(max(r1.bottom(), r2.bottom()) + DROP_PX)
+
+        x = max(0, min(x, left.width() - btn.width()))
+        y = max(0, min(y, left.height() - btn.height()))
+        btn.move(x, y)
 
     def on_pick_view_bg(self):
         c = QtWidgets.QColorDialog.getColor(self.view_bg_color, self, "画像表示領域の背景色",
@@ -9853,6 +10274,605 @@ class CropperApp(QtWidgets.QMainWindow):
         """右に90度回転（時計回り）"""
         from PIL import Image
         self._rotate_90_common(Image.ROTATE_270)
+
+    # ============================================================
+    # 背景切り抜きモデル選択（UI用）
+    # ============================================================
+
+    def _get_bg_models_dict(self):
+        """background_removal.get_available_bg_models() を安全に dict で取得"""
+        try:
+            if callable(get_available_bg_models):
+                return dict(get_available_bg_models() or {})
+        except Exception:
+            pass
+        return {}
+
+    def _bg_license_note_common(self) -> str:
+        # 右クリックメニューの一番下に出す “共通の注意”
+        return "※ 商用利用は各モデルの利用規約に従ってください（RMBG-2.0 は要許諾/要ライセンスの場合があります）"
+
+    def _bg_license_note_for_model(self, model_key: str) -> str:
+        # ボタンtooltipや各モデル項目のtooltipに出す “モデル別の注意”
+        if model_key == "bria_rmbg_2_0":
+            return "※ RMBG-2.0：商用利用は別途許諾/ライセンスが必要な場合があります（提供元の規約を確認）"
+        # 1.4 も含めて、断定せず「規約に従う」表現に寄せる
+        return "※ 商用利用の可否はモデル提供元の規約に従ってください"
+
+
+    def _bg_model_label(self, info, key: str) -> str:
+        """BgModelInfo / dict どちらでも label を取れるようにする"""
+        try:
+            if info is None:
+                return key
+            if isinstance(info, dict):
+                return str(info.get("label", key))
+            return str(getattr(info, "label", key) or key)
+        except Exception:
+            return key
+
+    def _ensure_bg_model_key_valid(self):
+        """settings.ini から読んだ bg_model_key が無効なら、利用可能な先頭へ矯正"""
+        models = self._get_bg_models_dict()
+        if not models:
+            return
+
+        cur = str(getattr(self, "bg_model_key", "") or "")
+        if cur not in models:
+            # 利用可能な先頭モデルへ
+            new_key = next(iter(models.keys()))
+            self.bg_model_key = new_key
+            try:
+                self.settings.setValue("bg_model_key", new_key)
+            except Exception:
+                pass
+
+    def _set_bg_model_key(self, key: str):
+        """UIからモデルキーを切り替える（保存＋bg_manager破棄）"""
+        models = self._get_bg_models_dict()
+        if models and key not in models:
+            QtWidgets.QApplication.beep()
+            return
+
+        old = str(getattr(self, "bg_model_key", "") or "")
+        if old == key:
+            return
+
+        self.bg_model_key = str(key)
+
+        # 設定に保存
+        try:
+            self.settings.setValue("bg_model_key", self.bg_model_key)
+        except Exception:
+            pass
+
+        # 次回クリックで選択モデルが反映されるように破棄
+        self.bg_manager = None
+
+        # ログだけ出す（ツールチップは _update_bg_remove_button_enabled に任せる）
+        try:
+            info = models.get(self.bg_model_key) if models else None
+            label = self._bg_model_label(info, self.bg_model_key)
+            log_debug(f"[BG] model switched: {old} -> {self.bg_model_key} ({label})")
+        except Exception:
+            pass
+
+        # ★ 最後にボタン状態 & ツールチップを再計算
+        try:
+            self._update_bg_remove_button_enabled()
+        except Exception:
+            pass
+
+    def _install_bg_model_menu(self, menubar: QtWidgets.QMenuBar):
+        """メニューバーに『背景切り抜きモデル』メニューを追加"""
+        models = self._get_bg_models_dict()
+        if not models:
+            return
+
+        # 背景切り抜きモデルのキャッシュ状況を取得
+        cached_keys: set[str] | None = None
+        try:
+            from background_removal import list_cached_models
+            cached_keys = set(list_cached_models())
+        except Exception:
+            # 失敗したら従来挙動（全部有効）にフォールバック
+            cached_keys = None
+
+        menu = menubar.addMenu("背景切り抜きモデル")
+        grp = QActionGroup(self)
+        grp.setExclusive(True)
+
+        cur = str(getattr(self, "bg_model_key", "") or "")
+
+        for key, info in models.items():
+            label = self._bg_model_label(info, key)
+            act = QAction(label, self, checkable=True)
+
+            # --- ここがポイント：インストール済みモデルだけ有効にする ---
+            is_cached = True
+            if cached_keys is not None:
+                is_cached = key in cached_keys
+
+            act.setEnabled(is_cached)
+            if not is_cached:
+                act.setToolTip(
+                    "このモデルはまだインストールされていません。\n"
+                    "別途用意したモデルセットアップ用バッチを実行してください。"
+                )
+
+            # チェック状態は「現在選択中 かつ インストール済み」のときだけ
+            if key == cur and is_cached:
+                act.setChecked(True)
+
+            act.triggered.connect(
+                lambda _checked=False, k=key: self._set_bg_model_key(k)
+            )
+            grp.addAction(act)
+            menu.addAction(act)
+
+        # 参照保持
+        self._bg_model_menu = menu
+        self._bg_model_action_group = grp
+
+    def _install_bg_model_context_menu_on_button(self):
+        """『背景切り抜き』ボタンの右クリックでモデル選択できるようにする"""
+        if not hasattr(self, "btn_bg_remove"):
+            return
+
+        self.btn_bg_remove.setContextMenuPolicy(
+            QtCore.Qt.ContextMenuPolicy.CustomContextMenu
+        )
+
+        def _popup(pos):
+            models = self._get_bg_models_dict()
+            if not models:
+                return
+
+            # 毎回 最新のキャッシュ状況を取得
+            cached_keys: set[str] | None = None
+            try:
+                from background_removal import list_cached_models
+                cached_keys = set(list_cached_models())
+            except Exception:
+                cached_keys = None
+
+            m = QtWidgets.QMenu(self)
+            try:
+                m.setToolTipsVisible(True)
+            except Exception:
+                pass
+
+            grp = QActionGroup(m)
+            grp.setExclusive(True)
+
+            cur = str(getattr(self, "bg_model_key", "") or "")
+            common_note = self._bg_license_note_common()
+
+            for key, info in models.items():
+                label = self._bg_model_label(info, key)
+                act = QAction(label, m, checkable=True)
+
+                # --- ここも「インストール済みだけ有効」 ---
+                is_cached = True
+                if cached_keys is not None:
+                    is_cached = key in cached_keys
+
+                act.setEnabled(is_cached)
+
+                # ★ 各モデルの注意（インストール済み/未済みどちらにも付与）
+                tip_lines = [self._bg_license_note_for_model(key)]
+                if not is_cached:
+                    tip_lines.append("")
+                    tip_lines.append("このモデルはまだインストールされていません。")
+                    tip_lines.append("別途用意したモデルセットアップ用バッチを実行してください。")
+                act.setToolTip("\n".join(tip_lines))
+
+                if key == cur and is_cached:
+                    act.setChecked(True)
+
+                act.triggered.connect(
+                    lambda _checked=False, k=key: self._set_bg_model_key(k)
+                )
+                grp.addAction(act)
+                m.addAction(act)
+
+            # ★ メニュー末尾に “見える注意書き” を追加
+            if m.actions():
+                m.addSeparator()
+                note_act = QAction(common_note, m)
+                note_act.setEnabled(False)
+                m.addAction(note_act)
+
+                btn = self.btn_bg_remove
+
+                # 右クリックメニュー表示（閉じるまでここで止まる）
+                m.exec(btn.mapToGlobal(pos))
+
+                # hover stuck 対策（既存のままでOK）
+                try:
+                    gpos = QtGui.QCursor.pos()
+                    if not btn.rect().contains(btn.mapFromGlobal(gpos)):
+                        QtWidgets.QApplication.postEvent(
+                            btn, QtCore.QEvent(QtCore.QEvent.Type.Leave)
+                        )
+                    btn.update()
+                except Exception:
+                    pass
+
+        self.btn_bg_remove.customContextMenuRequested.connect(_popup)
+
+    def remove_background_on_current_image(self):
+        if self.image is None:
+            return
+
+        # --- bg manager lazy init ---
+        if getattr(self, "bg_manager", None) is None:
+            try:
+                key = getattr(self, "bg_model_key", "bria_rmbg_1_4")
+                models = get_available_bg_models() if callable(get_available_bg_models) else {}
+                info = models.get(key, None)
+
+                title = key
+                if info is not None:
+                    try:
+                        title = info.get("label", key)
+                    except Exception:
+                        title = getattr(info, "label", key) or key
+
+                log_debug(f"[BG] 背景切り抜きモデルを遅延初期化: {key} ({title})")
+                self.bg_manager = BackgroundRemovalManager(model_key=key)
+            except Exception as e:
+                log_debug(f"[BG] 背景切り抜きモデルの初期化に失敗しました: {e!r}")
+                QMessageBox.warning(
+                    self,
+                    "背景切り抜き",
+                    "背景切り抜きの初期化に失敗しました。\n"
+                    "ライブラリのインストール状況を確認してください。\n\n"
+                    f"{e}",
+                )
+                self.bg_manager = None
+                return
+
+        # --- 現在の“画像座標”の矩形（あれば）を取得 ---
+        def _get_crop_box_img():
+            img = self.image
+            if img is None:
+                return None
+            img_w, img_h = img.size
+
+            # ★優先順位：固定枠 → drag_rect_img → _crop_rect_img → (最後に) ラベル座標の_rectを変換
+            img_rect = getattr(self.label, "fixed_crop_rect_img", None)
+            if img_rect is not None:
+                x = int(img_rect.left());  y = int(img_rect.top())
+                w = int(img_rect.width()); h = int(img_rect.height())
+            else:
+                dr = getattr(self.label, "drag_rect_img", None)
+                if dr is not None:
+                    x = int(dr.left());  y = int(dr.top())
+                    w = int(dr.width()); h = int(dr.height())
+                else:
+                    r = getattr(self, "_crop_rect_img", None)
+                    if r is not None:
+                        x = int(r.left());  y = int(r.top())
+                        w = int(r.width()); h = int(r.height())
+                    else:
+                        # 最後の保険：ラベル座標の矩形から変換
+                        rect_label = getattr(self, "_crop_rect", None)
+                        if rect_label is None:
+                            return None
+                        x1, y1 = rect_label.left(), rect_label.top()
+                        x2, y2 = rect_label.left() + rect_label.width(), rect_label.top() + rect_label.height()
+                        gx1, gy1 = self.label.label_to_image_coords(x1, y1)
+                        gx2, gy2 = self.label.label_to_image_coords(x2, y2)
+                        x = min(gx1, gx2); y = min(gy1, gy2)
+                        w = abs(gx2 - gx1); h = abs(gy2 - gy1)
+
+            left   = max(0, x)
+            top    = max(0, y)
+            right  = min(img_w, x + w)
+            bottom = min(img_h, y + h)
+
+            if right - left <= 0 or bottom - top <= 0:
+                return None
+            return (left, top, right, bottom)
+
+        box = _get_crop_box_img()
+
+        # --- 実行範囲の選択 ---
+        apply_rect_only = False
+
+        if box is not None:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("背景切り抜きの実行")
+            msg.setIcon(QMessageBox.Icon.Question)
+            msg.setText("矩形が設定されています。どちらに適用しますか？")
+
+            btn_rect = msg.addButton("矩形だけ", QMessageBox.ButtonRole.AcceptRole)
+            btn_all  = msg.addButton("全体", QMessageBox.ButtonRole.DestructiveRole)
+            btn_cancel = msg.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+
+            msg.setDefaultButton(btn_rect)
+            msg.exec()
+
+            clicked = msg.clickedButton()
+            if clicked == btn_cancel or clicked is None:
+                return
+            apply_rect_only = (clicked == btn_rect)
+        else:
+            ret = QMessageBox.question(
+                self,
+                "背景切り抜き",
+                "背景を切り抜いて透過にします。\n実行しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+            apply_rect_only = False
+
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        try:
+            pil_in = self.image
+            if pil_in is None:
+                raise RuntimeError("画像が読み込まれていません")
+
+            if apply_rect_only and box is not None:
+                left, top, right, bottom = box
+
+                base = pil_in.convert("RGBA")
+                crop = base.crop((left, top, right, bottom))
+
+                # ★ここは「トリミングした画像に背景除去」＝出力は小さい画像
+                pil_out = self.bg_manager.remove_background(crop)
+                if isinstance(pil_out, (tuple, list)):
+                    pil_out = pil_out[0]
+                pil_out = pil_out.convert("RGBA")
+
+                self.image = pil_out
+
+                # ★矩形も「新しい画像全体」に追従させる
+                new_full = QtCore.QRect(0, 0, self.image.width, self.image.height)
+                self._crop_rect_img = QtCore.QRect(new_full)
+                try:
+                    if getattr(self.label, "fixed_crop_mode", False):
+                        self.label.fixed_crop_rect_img = QtCore.QRect(new_full)
+                        self.label.drag_rect_img = None
+                    else:
+                        self.label.drag_rect_img = QtCore.QRect(new_full)
+                        self.label.fixed_crop_rect_img = None
+                except Exception:
+                    pass
+
+                log_debug(f"[BG] apply rect+trim: box={box}")
+
+            else:
+                pil_out = self.bg_manager.remove_background(pil_in)
+                if isinstance(pil_out, (tuple, list)):
+                    pil_out = pil_out[0]
+                pil_out = pil_out.convert("RGBA")
+
+                self.image = pil_out
+
+                # 「全体」はサイズ不変の想定：はみ出しだけクランプして維持
+                try:
+                    r = None
+                    if getattr(self.label, "fixed_crop_rect_img", None) is not None:
+                        r = QtCore.QRect(self.label.fixed_crop_rect_img)
+                    elif getattr(self.label, "drag_rect_img", None) is not None:
+                        r = QtCore.QRect(self.label.drag_rect_img)
+                    elif getattr(self, "_crop_rect_img", None) is not None:
+                        r = QtCore.QRect(self._crop_rect_img)
+
+                    if r is not None:
+                        bounds = QtCore.QRect(0, 0, self.image.width, self.image.height)
+                        r = r.intersected(bounds)
+                        self._crop_rect_img = QtCore.QRect(r)
+                        if getattr(self.label, "fixed_crop_mode", False):
+                            self.label.fixed_crop_rect_img = QtCore.QRect(r)
+                        else:
+                            self.label.drag_rect_img = QtCore.QRect(r)
+                except Exception:
+                    pass
+
+                log_debug("[BG] apply full")
+
+            # --- ピクスマップ再生成 & 再描画 ---
+            self._base_pixmap_dirty = True
+            self._scaled_pixmap = None
+            self._scaled_key = None
+
+            # 固定枠モードならUI同期（あれば）
+            try:
+                self._sync_fixed_ui_after_image_change()
+            except Exception:
+                pass
+
+            # 再描画
+            self.show_image()
+
+            # ★重要：ズーム中でもズレないように「ラベル座標の矩形」を作り直す
+            rect_label = None
+            if self.label.fixed_crop_mode and getattr(self.label, "fixed_crop_rect_img", None) is not None:
+                rect_label = self.label._fixed_rect_labelcoords()
+            elif getattr(self.label, "drag_rect_img", None) is not None:
+                rect_label = self.label._drag_rect_labelcoords()
+
+            if rect_label is not None:
+                self._crop_rect = QtCore.QRect(rect_label)
+            else:
+                self._crop_rect = None
+
+            # --- 解像度ラベル & プレビュー更新（画像座標で統一） ---
+            r_img = None
+            if getattr(self.label, "fixed_crop_rect_img", None) is not None and getattr(self.label, "fixed_crop_mode", False):
+                r_img = QtCore.QRect(self.label.fixed_crop_rect_img)
+            elif getattr(self.label, "drag_rect_img", None) is not None:
+                r_img = QtCore.QRect(self.label.drag_rect_img)
+            elif getattr(self, "_crop_rect_img", None) is not None:
+                r_img = QtCore.QRect(self._crop_rect_img)
+
+            if r_img is None:
+                r_img = QtCore.QRect(0, 0, self.image.width, self.image.height)
+
+            self.update_crop_size_label(r_img, img_space=True)
+            self._schedule_preview(r_img)
+
+        except Exception as e:
+            log_debug(f"[BG] 背景切り抜き中にエラー: {e!r}")
+            QMessageBox.warning(self, "背景切り抜き", f"背景切り抜き中にエラーが発生しました。\n\n{e}")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def _bg_remove_pil(self, pil_img: Image.Image) -> Image.Image:
+        """
+        背景除去の呼び出しを統一。
+        bg_manager が (out, mask) を返しても out だけ返しても動くようにする。
+        """
+        res = self.bg_manager.remove_background(pil_img)  # type: ignore[call-arg]
+        if isinstance(res, tuple) and res:
+            res = res[0]
+        if not isinstance(res, Image.Image):
+            raise RuntimeError(f"BG remove returned unexpected type: {type(res)}")
+        return res.convert("RGBA")
+
+    def change_background_model(self, model_key: str):
+        """
+        背景切り抜きモデルを切り替えるヘルパ。
+        （UI側から呼ぶ想定）
+        """
+        # まず機能自体が無効なら何もしない（＋ボタン状態も更新）
+        if BackgroundRemovalManager is None:
+            QMessageBox.warning(self, "背景切り抜き", "背景切り抜き機能が有効になっていません。")
+            try:
+                self._update_bg_remove_button_enabled()
+            except Exception:
+                pass
+            return
+
+        # 事前チェック：そのモデルがローカルにあるか（無ければ切替させない）
+        try:
+            from background_removal import is_model_cached
+            if not is_model_cached(model_key):
+                QMessageBox.information(
+                    self,
+                    "背景切り抜きモデル",
+                    "このモデルはまだインストールされていません。\n"
+                    "先にセットアップ（モデルダウンロード）を実行してください。"
+                )
+                return
+        except Exception:
+            # 判定関数が無い/失敗した場合は、従来どおり try で実際に切替を試す
+            pass
+
+        try:
+            # マネージャ生成 or 切替
+            if self.bg_manager is None:
+                self.bg_manager = BackgroundRemovalManager(model_key=model_key)
+            else:
+                self.bg_manager.set_model(model_key)
+
+            # 成功したら状態保存
+            self.bg_model_key = model_key
+            self.settings.setValue("bg_model_key", model_key)
+
+            info = self.bg_manager.get_current_model_info()
+            QMessageBox.information(
+                self,
+                "背景切り抜きモデル",
+                f"背景切り抜きモデルを切り替えました。\n\n{info.label} ({info.key})",
+            )
+
+        except Exception as e:
+            # 失敗時：bg_model_key は更新しない（前のまま）
+            QMessageBox.warning(
+                self,
+                "背景切り替えエラー",
+                f"背景切り抜きモデルの切り替えに失敗しました。\n\n{e}",
+            )
+
+        finally:
+            # ★ここがポイント：成功/失敗どっちでもボタン状態を同期
+            try:
+                self._update_bg_remove_button_enabled()
+            except Exception:
+                pass
+
+    def _update_bg_remove_button_enabled(self) -> None:
+        """
+        背景切り抜きボタンの enable / tooltip を
+        - 機能が無効かどうか
+        - インストール済みモデルの有無
+        - 現在選択中のモデルがインストール済みか
+        で切り替える。
+        """
+        btn = getattr(self, "btn_bg_remove", None)
+        if btn is None:
+            return
+
+        common_note = self._bg_license_note_common()
+
+        def _disable(msg: str) -> None:
+            btn.setEnabled(False)
+            btn.setToolTip(msg)
+            btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.ArrowCursor))
+
+        def _enable(msg: str) -> None:
+            btn.setEnabled(True)
+            btn.setToolTip(msg)
+            btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+
+        # 1) 機能自体が無効（optional import 失敗）なら押せない
+        if BackgroundRemovalManager is None:
+            _disable(
+                "背景切り抜き機能は無効です。\n"
+                "背景切り抜き用のセットアップを実行してから起動してください。\n\n"
+                f"{common_note}"
+            )
+            return
+
+        # 2) モデルキャッシュ有無を background_removal 側で判定
+        try:
+            from background_removal import list_cached_models, is_model_cached, get_available_bg_models
+        except Exception as e:
+            _disable(
+                "背景切り抜き機能の読み込みに失敗しました。\n\n"
+                f"{e}\n\n"
+                f"{common_note}"
+            )
+            return
+
+        models = self._get_bg_models_dict()
+        cached = list_cached_models()
+
+        # 3) どのモデルもインストールされていない → ボタン完全グレーアウト + 説明
+        if not cached:
+            _disable(
+                "背景切り抜きモデルがインストールされていません。\n"
+                "別途用意したモデルセットアップ用バッチを実行してください。\n\n"
+                f"{common_note}"
+            )
+            return
+
+        # 4) 現在選択中モデルが未インストールなら、先頭のインストール済みに矯正
+        cur_key = str(getattr(self, "bg_model_key", "") or "")
+        if not cur_key or not is_model_cached(cur_key):
+            cur_key = cached[0]
+            self.bg_model_key = cur_key
+            try:
+                self.settings.setValue("bg_model_key", cur_key)
+            except Exception:
+                pass
+
+        info = models.get(cur_key) if models else None
+        label = self._bg_model_label(info, cur_key)
+
+        model_note = self._bg_license_note_for_model(cur_key)
+
+        _enable(
+            f"背景を切り抜く\n"
+            f"右クリック：モデル選択\n"
+            f"現在：{label}\n"
+            f"{model_note}"
+        )
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -10705,33 +11725,39 @@ class CropperApp(QtWidgets.QMainWindow):
         # “画像全体を覆っているか” 判定（後でコピー保存に使う）
         is_full_cover = (left == 0 and top == 0 and right == img_w and bottom == img_h)
 
+        saved_path = None  # ★必ず定義しておく（dst_path未定義事故を防ぐ）
+
         try:
             box = (left, top, right, bottom)
             cropped = self.image.crop(box)
 
             # 保存先ルート（Path で保持）
             if self.save_folder:
-                # 「フォルダ指定」などで固定されている場合はこちら
                 save_root = Path(self.save_folder)
             else:
-                # 「読込み元と同一」モード → 画像の元フォルダ
-                # （zip:// のときは zip が置いてあるフォルダ）
                 save_root = Path(self._get_image_source_dir(self.image_path))
 
-            # ホーム(~)展開など軽い正規化
             save_root = save_root.expanduser()
             save_root.mkdir(parents=True, exist_ok=True)
 
-            # 文字列パスとしても使いたい場面があるので、従来の folder も残しておく
-            folder = str(save_root)
-
             # 既存画像パスから「出力に使うファイル名だけ」を決定
             output_name = self._output_name_from_image_path()
-            # そのファイル名から拡張子を抜き出して保存形式を決める
             base, ext0 = os.path.splitext(output_name)
             orig_ext = ext0.lower().lstrip(".")
-            # 出力拡張子（未知はpng）
             save_ext = orig_ext if orig_ext in ("jpg","jpeg","png","bmp","gif","tif","tiff","webp") else "png"
+
+            # ===== 透過があるか？（Pモード transparency も拾う）=====
+            try:
+                has_alpha = ("A" in cropped.getbands()) or (cropped.mode == "P" and "transparency" in (cropped.info or {}))
+            except Exception:
+                has_alpha = False
+
+            # ★透過がある時だけ、ユーザー設定（png/webp）に強制
+            if has_alpha:
+                pref = str(getattr(self, "alpha_output_format", "png")).lower()
+                if pref not in ("png", "webp"):
+                    pref = "png"
+                save_ext = pref
 
             # ===== メタデータ（EXIF/ICC）を拾う =====
             src_info = {}
@@ -10743,42 +11769,51 @@ class CropperApp(QtWidgets.QMainWindow):
             exif = src_info.get("exif")
             icc  = src_info.get("icc_profile")
 
-            # ===== 形式別の保存キーワード =====
+            # ===== 形式別の保存キーワード（save_ext確定後に作る）=====
             save_kw = {}
             if save_ext in ("jpg", "jpeg"):
                 save_kw.update(dict(quality=95, subsampling=0, optimize=True))
             elif save_ext == "webp":
-                save_kw.update(dict(quality=90, method=6))
+                # αがあるときは劣化しやすいので、まずはlossless寄りを推奨
+                if has_alpha:
+                    save_kw.update(dict(lossless=True, quality=100, method=6))
+                else:
+                    save_kw.update(dict(quality=90, method=4))
             elif save_ext == "png":
                 save_kw.update(dict(compress_level=6))
+
             if exif:
                 save_kw["exif"] = exif
             if icc:
                 save_kw["icc_profile"] = icc
 
+            # save対象（jpgのときだけ互換化）
+            def _img_for_save(img):
+                if save_ext in ("jpg", "jpeg"):
+                    return self._ensure_jpeg_compatible(img, save_ext)
+                return img
+
             # ========== 上書き保存モード ==========
             if getattr(self, "overwrite_mode", False):
                 import shutil
 
-                if self.save_folder:
-                    save_root = Path(self.save_folder).expanduser()
-                    save_root.mkdir(parents=True, exist_ok=True)
-                    folder = str(save_root)
+                # 上書き時の出力ファイル名：
+                # 透過が発生して拡張子が変わる場合は base はそのままで拡張子だけ変える
+                dst_name = f"{base}.{save_ext}"
+                dst_path = str(save_root / dst_name)
 
-                dst_path = str(save_root / output_name)
-
-                # ---- “全体覆い”かつロッシー形式はコピーで無劣化 ----
-                if is_full_cover and orig_ext in ("jpg", "jpeg", "webp"):
+                # ---- “全体覆い”かつロッシー形式かつ拡張子も同じならコピーで無劣化 ----
+                if is_full_cover and save_ext in ("jpg", "jpeg", "webp") and save_ext == orig_ext:
                     try:
                         if os.path.normcase(os.path.abspath(self.image_path)) != os.path.normcase(os.path.abspath(dst_path)):
                             shutil.copy2(self.image_path, dst_path)
                         print("上書き保存(コピーで無劣化):", dst_path)
                     except Exception as e:
                         print("[SAVE WARNING] copy2失敗 -> エンコード保存にフォールバック:", e)
-                        self._ensure_jpeg_compatible(cropped, save_ext).save(dst_path, **save_kw)
+                        _img_for_save(cropped).save(dst_path, **save_kw)
                         print("上書き保存(エンコード):", dst_path)
                 else:
-                    self._ensure_jpeg_compatible(cropped, save_ext).save(dst_path, **save_kw)
+                    _img_for_save(cropped).save(dst_path, **save_kw)
                     print("上書き保存:", dst_path)
 
                 # mtime を確実に動かす（低粒度FS対策）
@@ -10788,18 +11823,11 @@ class CropperApp(QtWidgets.QMainWindow):
                     pass
 
                 # ★ 上書き時の「開き直し」条件分岐
-                #   1) 保存先が読込元と同一 → 開き直して即反映
-                #   2) 保存先が別           → 開き直しなし
                 try:
-                    # 読み込み元の“基準フォルダ”
-                    # （zip:// 等も考慮したいなら _get_image_source_dir を使うのが安全）
                     src_dir = os.path.normcase(os.path.abspath(self._get_image_source_dir(self.image_path)))
-
-                    # 保存先フォルダ（save_root は overwrite ブロックで確定済み）
                     dst_dir = os.path.normcase(os.path.abspath(str(save_root)))
 
                     if src_dir == dst_dir:
-                        # 可能ならUI状態を温存してから開き直す
                         try:
                             state = self._snapshot_adjust_state()
                             if not state:
@@ -10808,7 +11836,6 @@ class CropperApp(QtWidgets.QMainWindow):
                             state = {"rect": "full"}
                         self._preserve_ui_on_next_load = state
 
-                        # 次の読み込み1回だけ保存先ダイアログ抑止（持っているなら）
                         try:
                             s = getattr(self, "_suppress_save_dialog_paths", None)
                             if s is None:
@@ -10818,18 +11845,14 @@ class CropperApp(QtWidgets.QMainWindow):
                         except Exception:
                             pass
 
-                        # 同一フォルダ上書きは “保存した実体” を開き直す
                         try:
                             self.open_image_from_path(dst_path)
                         except Exception:
                             pass
-                    else:
-                        # 保存先が別フォルダなら、見た目リセットを避けるため開き直さない
-                        pass
-
                 except Exception:
                     pass
-                
+
+                # サムネキャッシュ無効化（パスが確定してから）
                 try:
                     if getattr(self, "model", None):
                         print("[thumb] invalidate request:", dst_path)
@@ -10837,15 +11860,11 @@ class CropperApp(QtWidgets.QMainWindow):
                 except Exception as e:
                     print("[thumb] invalidate request failed:", e)
 
-                return True, dst_path
+                saved_path = dst_path
+                return True, saved_path
 
             # ========== 通常（連番保存） ==========
-            # ① α有のときJPEGは避け、pngに自動切替
-            has_alpha = ("A" in cropped.getbands())
-            if save_ext in ("jpg", "jpeg") and has_alpha:
-                save_ext = "png"
-
-            # ② 連番を探す
+            # 連番を探す
             i = 1
             candidate = None
             while i < 1000:
@@ -10857,9 +11876,9 @@ class CropperApp(QtWidgets.QMainWindow):
             if i >= 1000:
                 raise RuntimeError("保存先に連番の空きがありません (001-999).")
 
-            candidate = str(candidate)  # この先は文字列として扱う
+            candidate = str(candidate)
 
-            # ③ “全体覆い”かつ ロッシー形式で拡張子も同じなら コピーで無劣化
+            # “全体覆い”かつ ロッシー形式で拡張子も同じなら コピーで無劣化
             if is_full_cover and save_ext in ("jpg", "jpeg", "webp") and save_ext == orig_ext:
                 try:
                     import shutil
@@ -10867,13 +11886,14 @@ class CropperApp(QtWidgets.QMainWindow):
                     print("保存(コピーで無劣化):", candidate)
                 except Exception as e:
                     print("[SAVE WARNING] copy2失敗 -> エンコード保存にフォールバック:", e)
-                    self._ensure_jpeg_compatible(cropped, save_ext).save(candidate, **save_kw)
+                    _img_for_save(cropped).save(candidate, **save_kw)
                     print("保存(エンコード):", candidate)
             else:
-                self._ensure_jpeg_compatible(cropped, save_ext).save(candidate, **save_kw)
+                _img_for_save(cropped).save(candidate, **save_kw)
                 print("保存:", candidate)
 
-            return True, candidate
+            saved_path = candidate
+            return True, saved_path
 
         except Exception as e:
             print("[SAVE ERROR]", e)
@@ -13079,6 +14099,10 @@ if __name__ == "__main__":
     if "--debug-log" in sys.argv:
         LOG_ENABLED = True
         sys.argv.remove("--debug-log")  # Qt に渡さないように消しておく
+
+    # ★ どの Python / venv で動いているかログに出す
+    log_debug(f"[ENV] sys.executable = {sys.executable}")
+    log_debug(f"[ENV] VIRTUAL_ENV   = {os.environ.get('VIRTUAL_ENV')}")
 
     app = QtWidgets.QApplication(sys.argv)
     win = CropperApp()

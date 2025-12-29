@@ -1,0 +1,5 @@
+numpy
+transformers
+timm
+kornia
+huggingface_hub<1.0
