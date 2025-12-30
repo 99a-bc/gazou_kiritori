@@ -10,22 +10,22 @@ from pathlib import Path
 from PIL import Image
 
 # ============================================================
-# Debug（背景切り抜き）
+# Debug print helper
 # ============================================================
-# 通常はコンソールにログを出しません。
-# 必要なときだけ環境変数で有効化してください:
-#   set GAZOU_KIRITORI_BG_DEBUG=1
-_BG_DEBUG = os.environ.get("GAZOU_KIRITORI_BG_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
 
+_BG_DEBUG = os.environ.get("GAZOU_BG_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
 
-def _dbg_print(*args, **kwargs) -> None:
+def set_bg_debug(flag: bool) -> None:
+    """このモジュール内のデバッグprintをON/OFFする。"""
+    global _BG_DEBUG
+    _BG_DEBUG = bool(flag)
+
+def _dbg(*args, **kwargs) -> None:
+    """debug時だけprintする。"""
     if _BG_DEBUG:
         print(*args, **kwargs)
 
-
 def _dbg_cuda_mem(tag: str) -> None:
-    if not _BG_DEBUG:
-        return
     try:
         import torch
         if not torch.cuda.is_available():
@@ -33,9 +33,9 @@ def _dbg_cuda_mem(tag: str) -> None:
         alloc = torch.cuda.memory_allocated() / (1024 ** 2)
         rsv = torch.cuda.memory_reserved() / (1024 ** 2)
         maxa = torch.cuda.max_memory_allocated() / (1024 ** 2)
-        _dbg_print(f"[BG][CUDA] {tag} alloc={alloc:.1f}MiB reserved={rsv:.1f}MiB max_alloc={maxa:.1f}MiB")
+        _dbg(f"[BG][CUDA] {tag} alloc={alloc:.1f}MiB reserved={rsv:.1f}MiB max_alloc={maxa:.1f}MiB")
     except Exception as e:
-        _dbg_print(f"[BG][CUDA] mem stat failed: {e}")
+        _dbg(f"[BG][CUDA] mem stat failed: {e}")
 
 # ============================================================
 # Model Info
@@ -111,20 +111,31 @@ def _dedup_paths(paths: list[Path]) -> list[Path]:
 def _candidate_hf_cache_dirs() -> list[Path]:
     """
     Hugging Face Hub のキャッシュ候補ディレクトリを列挙（存在しなくても返す）。
-    ここは“推測”なので、必要なら環境変数で固定するのが一番確実。
+    このアプリでは、HF_HOME が設定されている場合は
+    そちらの hub ディレクトリだけを見るようにして、
+    ユーザー全体のグローバルキャッシュは無視する。
     """
     cand: list[Path] = []
 
+    # まず、このアプリ用に設定している HF_HOME を最優先で見る
+    v = os.environ.get("HF_HOME")
+    if v:
+        cand.append(Path(v) / "hub")
+        cand = _dedup_paths(cand)
+
+        # デバッグ用ログ
+        _dbg("[BGDBG] HF cache candidates (HF_HOME only):")
+        for base in cand:
+            _dbg("  ", base)
+
+        return cand
+
+    # HF_HOME が無い場合だけ、従来どおりの推測ロジックを使う
     # 最優先：明示指定
     for key in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
         v = os.environ.get(key)
         if v:
             cand.append(Path(v))
-
-    # HF_HOME がある場合はその配下の hub
-    v = os.environ.get("HF_HOME")
-    if v:
-        cand.append(Path(v) / "hub")
 
     # TRANSFORMERS_CACHE が指定されてるケース（環境によって hub 直や transformers 直がある）
     v = os.environ.get("TRANSFORMERS_CACHE")
@@ -136,8 +147,13 @@ def _candidate_hf_cache_dirs() -> list[Path]:
     # デフォルト（Windows でもここになりがち）
     cand.append(Path.home() / ".cache" / "huggingface" / "hub")
 
-    return _dedup_paths(cand)
+    cand = _dedup_paths(cand)
 
+    _dbg("[BGDBG] HF cache candidates (fallback):")
+    for base in cand:
+        _dbg("  ", base)
+
+    return cand
 
 def _repo_id_to_cache_dirname(repo_id: str) -> str:
     """
@@ -197,8 +213,12 @@ def is_model_cached(model_key: str) -> bool:
     repo = str(info.params.get("repo", "")).strip()
     if not repo:
         return False
-    return is_hf_repo_cached(repo)
 
+    _dbg("[BGDBG] is_model_cached:", model_key, "repo=", repo)
+
+    ok = is_hf_repo_cached(repo)
+    _dbg("[BGDBG]   ->", ok)
+    return ok
 
 def list_cached_models() -> list[str]:
     cached: list[str] = []
@@ -415,7 +435,7 @@ class _BriaRmbgBackend(_BackendBase):
         vmax = float(pred_hw.max().item())
 
         if self.debug:
-            print(f"[BG] pred range: min={vmin:.6f}, max={vmax:.6f}, shape={tuple(pred_hw.shape)}")
+            _dbg(f"[BG] pred range: min={vmin:.6f}, max={vmax:.6f}, shape={tuple(pred_hw.shape)}")
 
         if vmax > 1.5 or vmin < -0.5:
             prob = torch.sigmoid(pred_hw)
@@ -489,7 +509,7 @@ class _BriaRmbgBackend(_BackendBase):
                     pass
             _dbg_cuda_mem("after backend close")
         except Exception as e:
-            _dbg_print(f"[BG] backend close failed: {e}")
+            _dbg(f"[BG] backend close failed: {e}")
 
 # ============================================================
 # Backend Registry (登録制)
@@ -520,6 +540,7 @@ class BackgroundRemovalManager:
         self._model_key = model_key
         self._device = device
         self._debug = debug
+        set_bg_debug(debug)
 
         self._backend: Optional[_BackendBase] = None
         self._last_error: Optional[Exception] = None
@@ -585,16 +606,16 @@ class BackgroundRemovalManager:
 
     def _dispose_backend(self, reason: str = "") -> None:
         if self._backend is None:
-            _dbg_print(f"[BG] dispose skipped (backend None): key={self._model_key} reason={reason}")
+            _dbg(f"[BG] dispose skipped (backend None): key={self._model_key} reason={reason}")
             return
 
-        _dbg_print(f"[BG] dispose backend: key={self._model_key} reason={reason} backend={type(self._backend)}")
+        _dbg(f"[BG] dispose backend: key={self._model_key} reason={reason} backend={type(self._backend)}")
         try:
             import torch
             if torch.cuda.is_available():
                 a = torch.cuda.memory_allocated() / (1024**2)
                 r = torch.cuda.memory_reserved() / (1024**2)
-                _dbg_print(f"[BG] cuda mem before: alloc={a:.1f}MiB reserved={r:.1f}MiB")
+                _dbg(f"[BG] cuda mem before: alloc={a:.1f}MiB reserved={r:.1f}MiB")
         except Exception:
             pass
 
@@ -604,7 +625,7 @@ class BackgroundRemovalManager:
             if callable(close):
                 close()
         except Exception as e:
-            _dbg_print(f"[BG] backend.close() failed: {e!r}")
+            _dbg(f"[BG] backend.close() failed: {e!r}")
 
         self._backend = None
 
@@ -620,7 +641,7 @@ class BackgroundRemovalManager:
                 torch.cuda.empty_cache()
                 a = torch.cuda.memory_allocated() / (1024**2)
                 r = torch.cuda.memory_reserved() / (1024**2)
-                _dbg_print(f"[BG] cuda mem after : alloc={a:.1f}MiB reserved={r:.1f}MiB")
+                _dbg(f"[BG] cuda mem after : alloc={a:.1f}MiB reserved={r:.1f}MiB")
         except Exception:
             pass
 
