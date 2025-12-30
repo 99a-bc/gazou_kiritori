@@ -13,7 +13,10 @@ from PIL import Image
 # Debug print helper
 # ============================================================
 
-_BG_DEBUG = os.environ.get("GAZOU_BG_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
+_BG_DEBUG = (
+    os.environ.get("GAZOU_BG_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
+    or os.environ.get("GAZOU_KIRITORI_BG_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
+)
 
 def set_bg_debug(flag: bool) -> None:
     """このモジュール内のデバッグprintをON/OFFする。"""
