@@ -1,0 +1,3 @@
+# Windows batch / command scripts must be checked out with CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf

@@ -52,7 +52,7 @@ except Exception:
     py7zr = None
 
 APP_NAME = "画像切り取りツール"
-APP_VERSION = "1.2.0" 
+APP_VERSION = "1.2.1" 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
@@ -7236,6 +7236,23 @@ class CropperApp(QtWidgets.QMainWindow):
                 if not img:
                     return
                 rect_img = QtCore.QRect(0, 0, img.width, img.height)
+            else:
+                rect_img = QtCore.QRect(rect_img)
+
+            # ★ 保存直後だけは、矩形表示用とプレビュー用で別矩形を使えるようにする
+            preview_rect_img = None
+            try:
+                if preserve_dict:
+                    tmp_preview = preserve_dict.get("post_save_preview_rect_img")
+                    if tmp_preview is not None:
+                        r = _safe_qrect(tmp_preview, fmt="xywh")
+                        if r and not r.isNull():
+                            preview_rect_img = QtCore.QRect(r)
+            except Exception:
+                preview_rect_img = None
+
+            if preview_rect_img is None or preview_rect_img.isNull():
+                preview_rect_img = QtCore.QRect(rect_img)
 
             x1, y1 = self.label.image_to_label_coords(rect_img.left(),  rect_img.top())
             x2, y2 = self.label.image_to_label_coords(rect_img.right(), rect_img.bottom())
@@ -7267,14 +7284,17 @@ class CropperApp(QtWidgets.QMainWindow):
             # サイズラベル/プレビュー
             try:
                 if hasattr(self, "update_crop_size_label"):
-                    self.update_crop_size_label(rect_img, img_space=True)
+                    self.update_crop_size_label(preview_rect_img, img_space=True)
             except Exception:
                 pass
             try:
                 if hasattr(self, "safe_update_preview"):
-                    QtCore.QTimer.singleShot(0, lambda: self.safe_update_preview(rect_img))
+                    QtCore.QTimer.singleShot(
+                        0,
+                        lambda r=QtCore.QRect(preview_rect_img): self.safe_update_preview(r)
+                    )
                 elif hasattr(self, "_schedule_preview"):
-                    self._schedule_preview(rect_img)
+                    self._schedule_preview(preview_rect_img)
             except Exception:
                 pass
 
@@ -7343,6 +7363,16 @@ class CropperApp(QtWidgets.QMainWindow):
                     if (prev_rect_img is None or prev_rect_img.isNull()) and getattr(self.label, "drag_rect_img", None):
                         prev_rect_img = _safe_qrect(self.label.drag_rect_img, fmt="xywh")
 
+                # ★ 保存直後だけは「左上に再配置した矩形」を優先する
+                try:
+                    post_overlay = preserve.get("post_save_overlay_rect_img")
+                    if post_overlay is not None:
+                        r = _safe_qrect(post_overlay, fmt="xywh")
+                        if r and not r.isNull():
+                            prev_rect_img = QtCore.QRect(r)
+                            prev_fixed = bool(preserve.get("post_save_fixed", prev_fixed))
+                except Exception:
+                    pass
             # --- preserve が None のときだけ UI をクリア ---
             self._suspend_chain_clear += 1              # （ここから内部リセット扱い）
             try:
@@ -7549,16 +7579,34 @@ class CropperApp(QtWidgets.QMainWindow):
 
         # 8) 復元（dict のときだけ）。矩形は _crop_rect_img / fixed_rect が生きていればそれを使い、無ければ full。
         if isinstance(preserve, dict):
-            # heavy では読み込み“前”スナップショットは取れないので、現状から推測して復元
-            fallback_fixed = bool(getattr(self.label, "fixed_crop_mode", False) and getattr(self.label, "fixed_crop_rect_img", None))
+            # heavy では読み込み“前”スナップショットは取れないので、保存直後の専用指定があればそれを優先
+            fallback_fixed = False
             fallback_rect = None
-            if fallback_fixed:
-                fallback_rect = QtCore.QRect(self.label.fixed_crop_rect_img)
-            else:
-                tmp = getattr(self, "_crop_rect_img", None)
-                fallback_rect = _safe_qrect(tmp, fmt="xywh") if tmp is not None else QtCore.QRect()
-                if (fallback_rect is None or fallback_rect.isNull()) and getattr(self.label, "drag_rect_img", None):
-                    fallback_rect = _safe_qrect(self.label.drag_rect_img, fmt="xywh")
+
+            try:
+                post_overlay = preserve.get("post_save_overlay_rect_img")
+                if post_overlay is not None:
+                    r = _safe_qrect(post_overlay, fmt="xywh")
+                    if r and not r.isNull():
+                        fallback_rect = QtCore.QRect(r)
+                        fallback_fixed = bool(preserve.get("post_save_fixed", False))
+            except Exception:
+                fallback_rect = None
+                fallback_fixed = False
+
+            if fallback_rect is None or fallback_rect.isNull():
+                fallback_fixed = bool(
+                    getattr(self.label, "fixed_crop_mode", False)
+                    and getattr(self.label, "fixed_crop_rect_img", None)
+                )
+                if fallback_fixed:
+                    fallback_rect = QtCore.QRect(self.label.fixed_crop_rect_img)
+                else:
+                    tmp = getattr(self, "_crop_rect_img", None)
+                    fallback_rect = _safe_qrect(tmp, fmt="xywh") if tmp is not None else QtCore.QRect()
+                    if (fallback_rect is None or fallback_rect.isNull()) and getattr(self.label, "drag_rect_img", None):
+                        fallback_rect = _safe_qrect(self.label.drag_rect_img, fmt="xywh")
+
             _try_restore(preserve, fallback_rect_img=fallback_rect, fallback_fixed=fallback_fixed)
             self._preserve_ui_on_next_load = None
         try:
@@ -11712,6 +11760,10 @@ class CropperApp(QtWidgets.QMainWindow):
                 x = min(gx1, gx2); y = min(gy1, gy2)
                 w = abs(gx2 - gx1); h = abs(gy2 - gy1)
 
+        # ★ 保存前の矩形サイズ（画像外にはみ出していてもそのまま保持）
+        overlay_w = max(0, int(w))
+        overlay_h = max(0, int(h))
+
         # 画像境界にクランプ
         left   = max(0, x)
         top    = max(0, y)
@@ -11834,6 +11886,27 @@ class CropperApp(QtWidgets.QMainWindow):
                                 state = {"rect": "full"}
                         except Exception:
                             state = {"rect": "full"}
+
+                        # ★ 保存後は、矩形表示用とプレビュー用で別の矩形を持たせる
+                        try:
+                            saved_preview_w = max(0, int(right - left))
+                            saved_preview_h = max(0, int(bottom - top))
+
+                            # 表示用: 保存前の矩形サイズをそのまま左上へ再配置
+                            if overlay_w > 0 and overlay_h > 0:
+                                state["post_save_overlay_rect_img"] = (0, 0, overlay_w, overlay_h)
+
+                            # プレビュー用: 実際に保存された画像サイズだけ使う
+                            if saved_preview_w > 0 and saved_preview_h > 0:
+                                state["post_save_preview_rect_img"] = (0, 0, saved_preview_w, saved_preview_h)
+
+                            state["post_save_fixed"] = bool(
+                                getattr(self.label, "fixed_crop_mode", False)
+                                and getattr(self.label, "fixed_crop_rect_img", None) is not None
+                            )
+                        except Exception:
+                            pass
+
                         self._preserve_ui_on_next_load = state
 
                         try:
