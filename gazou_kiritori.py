@@ -52,7 +52,7 @@ except Exception:
     py7zr = None
 
 APP_NAME = "画像切り取りツール"
-APP_VERSION = "1.2.1" 
+APP_VERSION = "1.2.2" 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
@@ -7173,16 +7173,16 @@ class CropperApp(QtWidgets.QMainWindow):
                         self.open_folder(path)
                         event.acceptProposedAction()
                         return
-                    # 画像ファイルなら従来通り open_image_from_path
+                    # 画像ファイルなら D&D 時は必ずブラウザ側もフォーカス
                     ext = os.path.splitext(path)[1].lower()
                     if ext in self.IMAGE_EXTENSIONS:
                         self._defer_save_dialog_once = True
-                        self.open_image_from_path(path)
+                        self.open_image_from_path(path, focus_in_browser=True)
                         event.acceptProposedAction()
                         return
         event.ignore()
 
-    def open_image_from_path(self, file_path):
+    def open_image_from_path(self, file_path, *, focus_in_browser: bool = False):
         if not file_path:
             return
 
@@ -7341,10 +7341,16 @@ class CropperApp(QtWidgets.QMainWindow):
                     _restore_from_rect(fallback_rect_img, fallback_fixed, preserve_dict)
 
         if same_list:
-            # --- 先に index だけ合わせる ---
+            # --- 先に index だけ合わせる（正規化比較で安全に） ---
             try:
-                self.current_index = self.image_list.index(file_path)
-            except ValueError:
+                norm_target = norm_vpath(file_path)
+                self.current_index = next(
+                    (i for i, p in enumerate(self.image_list) if norm_vpath(p) == norm_target),
+                    -1
+                )
+                if self.current_index < 0:
+                    self.current_index = max(0, getattr(self, "current_index", 0))
+            except Exception:
                 self.current_index = max(0, getattr(self, "current_index", 0))
             log_debug(f"[open] light path: index={self.current_index}")
 
@@ -7373,8 +7379,9 @@ class CropperApp(QtWidgets.QMainWindow):
                             prev_fixed = bool(preserve.get("post_save_fixed", prev_fixed))
                 except Exception:
                     pass
+
             # --- preserve が None のときだけ UI をクリア ---
-            self._suspend_chain_clear += 1              # （ここから内部リセット扱い）
+            self._suspend_chain_clear += 1
             try:
                 if preserve is None:
                     try:
@@ -7391,35 +7398,39 @@ class CropperApp(QtWidgets.QMainWindow):
                         pass
 
                 # --- 画像だけ再読込 ---
-                self.load_image_by_index(self.current_index) 
+                self.load_image_by_index(self.current_index)
             finally:
-                self._suspend_chain_clear -= 1          # ← 追加（必ず戻す）
+                self._suspend_chain_clear -= 1
 
-            # --- サムネ選択同期（パス一致で安全に）---
+            # --- サムネ選択同期（パス一致で安全に） ---
             try:
-                self._sync_thumb_selection()
+                self._sync_thumb_selection(
+                    ensure_visible=focus_in_browser,
+                )
             except Exception:
                 pass
 
-            # --- ★ 復元：まず _restore_adjust_state、ダメなら“読み込み前スナップショット”で復元 ★
+            # --- ★ 復元：まず _restore_adjust_state、ダメなら“読み込み前スナップショット”で復元 ★ ---
             if isinstance(preserve, dict):
                 _try_restore(preserve, fallback_rect_img=prev_rect_img, fallback_fixed=prev_fixed)
                 self._preserve_ui_on_next_load = None
+
             try:
-                self._update_nav_buttons()   # ★ 追加
+                self._update_nav_buttons()
             except Exception:
                 pass
+
             # ★ 画像表示に切り替わるので、プレースホルダ状態を完全解除
             self._placeholder_active = False
-            self._placeholder_selected = False      # ← 追加
-            self._placeholder_hit_rect = None       # ← 追加
+            self._placeholder_selected = False
+            self._placeholder_hit_rect = None
             self._placeholder_path = ""
-            # ★ ActionPanel/Nudge をプレースホルダ都合で隠していた場合のフラグ解除
             self._panel_hidden_by_placeholder = False
             try:
-                self.label.setCursor(QtCore.Qt.CursorShape.CrossCursor)  # ← 明示的に十字へ
+                self.label.setCursor(QtCore.Qt.CursorShape.CrossCursor)
             except Exception:
                 pass
+
             log_debug("[open] done (light path)")
             return
 
@@ -7482,7 +7493,13 @@ class CropperApp(QtWidgets.QMainWindow):
 
         # 2) index（画像リスト内の位置）と、ビュー上の行(row)を分けて計算
         try:
-            self.current_index = self.image_list.index(file_path)
+            norm_target = norm_vpath(file_path)
+            self.current_index = next(
+                (i for i, p in enumerate(self.image_list) if norm_vpath(p) == norm_target),
+                -1
+            )
+            if self.current_index < 0:
+                raise ValueError
         except ValueError:
             # file_path が image_list に無い場合（削除された/存在しないなど）は、
             # ファイル名の自然順で「次に近い画像」を選ぶ
@@ -7504,11 +7521,9 @@ class CropperApp(QtWidgets.QMainWindow):
                             pos = i
                             break
                     else:
-                        # どれよりも後ろなら末尾にする
                         pos = len(L) - 1
                     self.current_index = pos
             except Exception:
-                # 何かあっても最悪 0 にして落ちないようにする
                 self.current_index = 0
 
         # フォルダを先頭に並べるので、ビュー上の行は「フォルダ数 + 画像index」
@@ -7565,7 +7580,9 @@ class CropperApp(QtWidgets.QMainWindow):
 
         # --- サムネ選択同期（パス一致で安全に）---
         try:
-            self._sync_thumb_selection()
+            self._sync_thumb_selection(
+                ensure_visible=focus_in_browser,
+            )
         except Exception:
             pass
 
@@ -8108,6 +8125,13 @@ class CropperApp(QtWidgets.QMainWindow):
             except Exception:
                 pass
             self._opening_folder = False
+
+            # ★ フォルダ遷移後は必ずナビボタン状態を再評価
+            try:
+                self._update_nav_buttons()
+            except Exception:
+                pass
+
             log_debug(f"[open_folder] <<< leave {dir_path}")
 
     # === Shift + ← / → でフォルダ移動 ===
@@ -9048,6 +9072,13 @@ class CropperApp(QtWidgets.QMainWindow):
         new_pos = self._nav_pos + int(delta)
         if 0 <= new_pos < len(self._nav_history):
             self._nav_pos = new_pos
+
+            # ★ 位置が変わった瞬間にまず反映
+            try:
+                self._update_nav_buttons()
+            except Exception:
+                pass
+
             target = self._nav_history[self._nav_pos]
             src = "back" if int(delta) < 0 else "forward"
             self.open_folder(target, _from_history=True, _src=src)
@@ -9161,10 +9192,10 @@ class CropperApp(QtWidgets.QMainWindow):
         if 0 <= self._nav_pos < len(self._nav_history) - 1:
             self._nav_history = self._nav_history[:self._nav_pos + 1]
 
-        cur_norm  = self._norm_path(parent)
+        parent_norm = self._norm_path(parent)
         last_norm = self._norm_path(self._nav_history[-1]) if self._nav_history else None
 
-        if last_norm != cur_norm:
+        if last_norm != parent_norm:
             self._nav_history.append(parent)
             self._nav_pos = len(self._nav_history) - 1
             if getattr(self, "_nav_debug", False):
@@ -9174,22 +9205,32 @@ class CropperApp(QtWidgets.QMainWindow):
             if getattr(self, "_nav_debug", False):
                 log_debug(f"[nav] skip-dup(up) -> pos={self._nav_pos} path={parent}")
 
-        # --- 開くときは“復元モード”で（③の要件：元の選択を復元） ---
+        # ★ 履歴が変わった瞬間にまず反映
+        try:
+            self._update_nav_buttons()
+        except Exception:
+            pass
+
+        # --- 開くときは“復元モード”で ---
         self._mark_child_for_up()
         self.open_folder(parent, _from_history=True, _src="up")
 
-    def _sync_thumb_selection(self):
+    def _sync_thumb_selection(self, *, ensure_visible: bool = False):
         """現在の self.image_path がブラウザ一覧の何行目かを探して選択。"""
         if not getattr(self, "image_path", None):
             return
         if not getattr(self, "model", None):
             return
+        if not getattr(self, "listview", None):
+            return
 
         path_now = norm_vpath(self.image_path)
         model = self.model
+        lv = self.listview
         target_row = -1
+
         for r in range(model.rowCount()):
-            info = model.data(model.index(r,0), QtCore.Qt.ItemDataRole.UserRole)
+            info = model.data(model.index(r, 0), QtCore.Qt.ItemDataRole.UserRole)
             try:
                 p = norm_vpath(info["path"])
             except Exception:
@@ -9197,8 +9238,17 @@ class CropperApp(QtWidgets.QMainWindow):
             if p == path_now:
                 target_row = r
                 break
+
         if target_row >= 0:
-            self.listview.setCurrentIndex(model.index(target_row, 0))
+            idx = model.index(target_row, 0)
+
+            if ensure_visible:
+                try:
+                    lv.scrollTo(idx, QtWidgets.QAbstractItemView.ScrollHint.PositionAtCenter)
+                except Exception:
+                    pass
+
+            lv.setCurrentIndex(idx)
 
     def on_thumb_double_clicked(self, index: QtCore.QModelIndex):
         if getattr(self, "_opening_folder", False):
