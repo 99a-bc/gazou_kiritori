@@ -9,11 +9,18 @@ REM ============================================================
 set "HF_HOME=%~dp0hf_home"
 if not exist "%HF_HOME%" mkdir "%HF_HOME%"
 
-REM ★ venv を必ず有効化
-call "%~dp0venv\Scripts\activate.bat"
+set "PYTHON=%~dp0venv\Scripts\python.exe"
 
-REM ★ venv の python でアプリを起動
-python "%~dp0gazou_kiritori.py"
+if not exist "%PYTHON%" (
+    echo [error] venv Python not found:
+    echo %PYTHON%
+    popd
+    endlocal
+    pause
+    exit /b 1
+)
+
+"%PYTHON%" "%~dp0gazou_kiritori.py"
 
 popd
 endlocal

@@ -52,7 +52,7 @@ except Exception:
     py7zr = None
 
 APP_NAME = "画像切り取りツール"
-APP_VERSION = "1.2.2" 
+APP_VERSION = "1.2.3" 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
