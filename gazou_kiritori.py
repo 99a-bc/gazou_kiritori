@@ -52,7 +52,7 @@ except Exception:
     py7zr = None
 
 APP_NAME = "画像切り取りツール"
-APP_VERSION = "1.2.3" 
+APP_VERSION = "1.2.4" 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
@@ -98,7 +98,7 @@ def _dbg_time(label, start=None):
 # ----------------------------------------
 # ログ出力制御
 # ----------------------------------------
-LOG_ENABLED = False  # デフォルトではログ出さない
+LOG_ENABLED = False # デフォルトではログ出さない
 
 def log_debug(*args, **kwargs):
     """
@@ -1224,6 +1224,473 @@ class DualRotateButton(QtWidgets.QWidget):
         p.drawText(right_bottom_rect, QtCore.Qt.AlignmentFlag.AlignCenter, "転")
 
         p.end()
+
+class _CropSizeDisplayLabel(QtWidgets.QLabel):
+    clicked = QtCore.pyqtSignal()
+    clickedSide = QtCore.pyqtSignal(str)   # ★ 追加: "left" / "right"
+
+    def __init__(self, text="0 x 0", parent=None):
+        super().__init__(text, parent)
+        self._hover = False
+        self._hover_side = None   # "left" / "right" / None
+        self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_Hover, True)
+        self.setMouseTracking(True)
+
+        # 自前描画する
+        self.setStyleSheet("")
+
+    def _side_from_pos(self, x: float):
+        return "left" if x < self.width() / 2 else "right"
+
+    def _split_text(self):
+        m = re.match(r"^\s*(\d+)\s*x\s*(\d+)\s*$", self.text())
+        if m:
+            return m.group(1), "x", m.group(2)
+        return "0", "x", "0"
+
+    def enterEvent(self, event):
+        self._hover = True
+        if hasattr(event, "position"):
+            self._hover_side = self._side_from_pos(event.position().x())
+        else:
+            self._hover_side = self._side_from_pos(event.pos().x())
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self._hover_side = None
+        self.update()
+        super().leaveEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if hasattr(event, "position"):
+            x = event.position().x()
+        else:
+            x = event.pos().x()
+
+        side = self._side_from_pos(x)
+        if side != self._hover_side:
+            self._hover_side = side
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            if hasattr(event, "position"):
+                side = self._side_from_pos(event.position().x())
+            else:
+                side = self._side_from_pos(event.pos().x())
+
+            self.clickedSide.emit(side)   # ★ 追加
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+
+        outer = self.rect().adjusted(1, 1, -1, -1)
+        radius = 8
+
+        # --- ベースラベル（常に同じ見た目） ---
+        p.setPen(QtGui.QPen(QtGui.QColor("#3a4f68"), 1))
+        p.setBrush(QtGui.QColor("#ffffff"))
+        p.drawRoundedRect(outer, radius, radius)
+
+        # --- 文字レイアウト計算 ---
+        left_text, sep_text, right_text = self._split_text()
+        fm = QtGui.QFontMetrics(self.font())
+
+        left_w = fm.horizontalAdvance(left_text)
+        sep_w = fm.horizontalAdvance(sep_text)
+        right_w = fm.horizontalAdvance(right_text)
+        gap = 14
+
+        total_w = left_w + gap + sep_w + gap + right_w
+        x0 = self.rect().center().x() - total_w // 2
+
+        left_rect = QtCore.QRect(
+            x0 - 6,
+            outer.top() + 6,
+            left_w + 12,
+            outer.height() - 12
+        )
+        sep_rect = QtCore.QRect(
+            left_rect.right() + gap - 2,
+            outer.top() + 6,
+            sep_w + 4,
+            outer.height() - 12
+        )
+        right_rect = QtCore.QRect(
+            sep_rect.right() + gap - 2,
+            outer.top() + 6,
+            right_w + 12,
+            outer.height() - 12
+        )
+
+        # --- hover反応（数字部分の下線だけ） ---
+        if self._hover and self._hover_side in ("left", "right"):
+            target_rect = left_rect if self._hover_side == "left" else right_rect
+
+            underline_y = target_rect.bottom() - 1
+            underline_left = target_rect.left() + 4
+            underline_right = target_rect.right() - 4
+
+            p.save()
+            p.setPen(QtGui.QPen(QtGui.QColor("#7fb2ff"), 2))
+            p.drawLine(underline_left, underline_y, underline_right, underline_y)
+            p.restore()
+
+        # --- 文字描画（常に通常色） ---
+        p.save()
+        p.setFont(self.font())
+        p.setPen(QtGui.QColor("#222222"))
+
+        p.drawText(
+            QtCore.QRect(left_rect.left(), outer.top(), left_rect.width(), outer.height()),
+            QtCore.Qt.AlignmentFlag.AlignCenter,
+            left_text
+        )
+        p.drawText(
+            QtCore.QRect(sep_rect.left(), outer.top(), sep_rect.width(), outer.height()),
+            QtCore.Qt.AlignmentFlag.AlignCenter,
+            sep_text
+        )
+        p.drawText(
+            QtCore.QRect(right_rect.left(), outer.top(), right_rect.width(), outer.height()),
+            QtCore.Qt.AlignmentFlag.AlignCenter,
+            right_text
+        )
+        p.restore()
+
+class _CropSizeLineEdit(QtWidgets.QLineEdit):
+    enterPressed = QtCore.pyqtSignal()
+    escapePressed = QtCore.pyqtSignal()
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter):
+            self.enterPressed.emit()
+            event.accept()
+            return
+        if key == QtCore.Qt.Key.Key_Escape:
+            self.escapePressed.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class InlineCropSizeWidget(QtWidgets.QFrame):
+    sizeConfirmed = QtCore.pyqtSignal(int, int)
+    editStarted = QtCore.pyqtSignal()
+    editCancelled = QtCore.pyqtSignal()
+    editFinished = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self._editing = False
+        self._last_text = "0 x 0"
+        self._edit_target_side = "left"   # ★ 追加
+        self._edit_enabled = True
+
+        self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+
+        self._stack = QtWidgets.QStackedLayout(self)
+        self._stack.setContentsMargins(0, 0, 0, 0)
+        self._stack.setStackingMode(QtWidgets.QStackedLayout.StackingMode.StackOne)
+
+        # --- 表示モード ---
+        self.display_label = _CropSizeDisplayLabel("0 x 0", self)
+        self.display_label.setToolTip("クリックで幅・高さを編集（固定サイズに切替）")
+        self._stack.addWidget(self.display_label)
+
+        f = self.display_label.font()
+        f.setPixelSize(32)
+        f.setBold(True)
+        try:
+            f.setFamilies(["Consolas", "Cascadia Mono", "Source Code Pro", "Meiryo", "Monospace"])
+        except AttributeError:
+            f.setFamily("Consolas")
+        self.display_label.setFont(f)
+
+        fm = QtGui.QFontMetrics(self.display_label.font())
+        reserve = fm.horizontalAdvance("9999 x 9999")
+        padding_lr = 40
+        fixed_w = reserve + padding_lr + 2
+        fixed_h = max(self.display_label.sizeHint().height(), fm.height() + 24)
+
+        self.setFixedWidth(fixed_w)
+        self.setFixedHeight(fixed_h)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed,
+            QtWidgets.QSizePolicy.Policy.Fixed
+        )
+
+        self.display_label.setFixedWidth(fixed_w)
+        self.display_label.setFixedHeight(fixed_h)
+
+        # --- 編集モード ---
+        self.editor_host = QtWidgets.QWidget(self)
+        self.editor_host.setFixedWidth(fixed_w)
+        self.editor_host.setFixedHeight(fixed_h)
+        self.editor_host.setStyleSheet("""
+            QWidget {
+                background: #ffffff;
+                border: 1px solid #5a84b8;
+                border-radius: 8px;
+            }
+            QLineEdit {
+                background: transparent;
+                color: #222;
+                border: none;
+                padding: 0px 4px;
+                selection-background-color: #2d6cdf;
+            }
+            QLabel {
+                color: #222;
+                background: transparent;
+                border: none;
+                padding: 0px;
+            }
+        """)
+
+        row = QtWidgets.QHBoxLayout(self.editor_host)
+        row.setContentsMargins(16, 8, 16, 8)
+        row.setSpacing(4)
+
+        self.width_edit = _CropSizeLineEdit(self.editor_host)
+        self.height_edit = _CropSizeLineEdit(self.editor_host)
+        self.sep_label = QtWidgets.QLabel("x", self.editor_host)
+        self.sep_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+
+        validator = QtGui.QRegularExpressionValidator(
+            QtCore.QRegularExpression(r"[0-9]{1,4}")
+        )
+        self.width_edit.setValidator(validator)
+        self.height_edit.setValidator(validator)
+
+        edit_font = QtGui.QFont(f)
+        self.width_edit.setFont(edit_font)
+        self.height_edit.setFont(edit_font)
+        self.sep_label.setFont(edit_font)
+
+        self.width_edit.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        self.height_edit.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+        self.width_edit.setFrame(False)
+        self.height_edit.setFrame(False)
+
+        row.addWidget(self.width_edit, 1)
+        row.addWidget(self.sep_label, 0)
+        row.addWidget(self.height_edit, 1)
+
+        self._stack.addWidget(self.editor_host)
+        self._stack.setCurrentWidget(self.display_label)
+
+        self.display_label.clickedSide.connect(self._on_display_label_clicked_side)
+        self.display_label.clicked.connect(self.begin_edit)
+        self.width_edit.enterPressed.connect(self.commit_edit)
+        self.height_edit.enterPressed.connect(self.commit_edit)
+        self.width_edit.escapePressed.connect(self.cancel_edit)
+        self.height_edit.escapePressed.connect(self.cancel_edit)
+
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.focusChanged.connect(self._on_app_focus_changed)
+
+        self._app = app
+        if self._app is not None:
+            self._app.installEventFilter(self)
+
+    def set_edit_enabled(self, enabled: bool):
+        self._edit_enabled = bool(enabled)
+
+        if self._edit_enabled:
+            self.display_label.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+            self.display_label.setToolTip("クリックで幅・高さを編集（固定サイズに切替）")
+        else:
+            self.display_label.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.ArrowCursor))
+            self.display_label.setToolTip("画像を読み込むと編集できます")
+            if self._editing:
+                self.cancel_edit()
+
+    def is_editing(self) -> bool:
+        return self._editing
+
+    def set_display_text(self, text: str):
+        self._last_text = str(text)
+        self.display_label.setText(self._last_text)
+
+    # --- QLabel互換の薄いラッパ ---
+    def setText(self, text: str):
+        self.set_display_text(text)
+
+    def text(self) -> str:
+        return self._last_text
+
+    def set_display_size(self, w: int, h: int):
+        self.set_display_text(f"{int(w)} x {int(h)}")
+
+    def _finish_edit_ui(self):
+        # hidden になる line edit に focus が残らないようにする
+        try:
+            self.width_edit.clearFocus()
+        except Exception:
+            pass
+        try:
+            self.height_edit.clearFocus()
+        except Exception:
+            pass
+
+        self._stack.setCurrentWidget(self.display_label)
+
+        # 念のため親側へ focus を逃がす
+        try:
+            self.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+        except Exception:
+            pass
+
+        # さらに display_label を前面の操作対象として更新
+        try:
+            self.display_label.update()
+        except Exception:
+            pass
+
+    def begin_edit(self):
+        if not self._edit_enabled:
+            return
+        if self._editing:
+            return
+
+        m = re.match(r"^\s*(\d+)\s*x\s*(\d+)\s*$", self._last_text)
+        if m:
+            w0, h0 = m.group(1), m.group(2)
+        else:
+            w0, h0 = "0", "0"
+
+        self.width_edit.setText(w0)
+        self.height_edit.setText(h0)
+
+        self._editing = True
+        self._stack.setCurrentWidget(self.editor_host)
+        self.editStarted.emit()
+
+        if self._edit_target_side == "right":
+            self.height_edit.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
+            self.height_edit.selectAll()
+        else:
+            self.width_edit.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
+            self.width_edit.selectAll()
+
+    def cancel_edit(self):
+        if not self._editing:
+            return
+        self._editing = False
+        self._finish_edit_ui()
+        self.editCancelled.emit()
+        self.editFinished.emit()
+
+    def _parse_valid_size(self):
+        w_text = self.width_edit.text()
+        h_text = self.height_edit.text()
+
+        # 空欄不可
+        if not w_text or not h_text:
+            return None
+
+        # 全角不可 + 半角数字のみ
+        if not re.fullmatch(r"[0-9]{1,4}", w_text):
+            return None
+        if not re.fullmatch(r"[0-9]{1,4}", h_text):
+            return None
+
+        try:
+            w = int(w_text)
+            h = int(h_text)
+        except Exception:
+            return None
+
+        # 1以上 / 上限9999
+        if not (1 <= w <= 9999):
+            return None
+        if not (1 <= h <= 9999):
+            return None
+
+        return (w, h)
+
+    def commit_edit(self):
+        if not self._editing:
+            return
+
+        parsed = self._parse_valid_size()
+        self._editing = False
+        self._finish_edit_ui()
+
+        if parsed is None:
+            self.editCancelled.emit()
+            self.editFinished.emit()
+            return
+
+        w, h = parsed
+        self.set_display_size(w, h)
+        self.sizeConfirmed.emit(w, h)
+        self.editFinished.emit()
+
+    def _on_display_label_clicked_side(self, side: str):
+        self._edit_target_side = "right" if side == "right" else "left"
+
+    def _on_app_focus_changed(self, old, now):
+        if not self._editing:
+            return
+
+        # 編集UI内部の移動（幅→高さ など）は無視
+        if now is not None:
+            cur = now
+            while cur is not None:
+                if cur is self.editor_host:
+                    return
+                cur = cur.parentWidget()
+
+        # 編集UIの外へ出た → 確定（不正なら内部でキャンセル）
+        QtCore.QTimer.singleShot(0, self.commit_edit)
+
+    def eventFilter(self, obj, event):
+        if not self._editing:
+            return super().eventFilter(obj, event)
+
+        if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+            try:
+                # クリック位置（グローバル座標）
+                if hasattr(event, "globalPosition"):
+                    gp = event.globalPosition().toPoint()
+                else:
+                    gp = event.globalPos()
+
+                # editor_host の画面上矩形
+                top_left = self.editor_host.mapToGlobal(QtCore.QPoint(0, 0))
+                rect = QtCore.QRect(top_left, self.editor_host.size())
+
+                # 編集ボックス外クリックなら確定
+                if not rect.contains(gp):
+                    QtCore.QTimer.singleShot(0, self.commit_edit)
+            except Exception:
+                pass
+
+        return super().eventFilter(obj, event)
+
+    def closeEvent(self, event):
+        try:
+            if getattr(self, "_app", None) is not None:
+                self._app.removeEventFilter(self)
+        except Exception:
+            pass
+        super().closeEvent(event)
 
 class SquareLabel(QtWidgets.QLabel):
     def __init__(self, parent=None, min_side=256, base_side=512):
@@ -3047,6 +3514,10 @@ class CropLabel(QtWidgets.QLabel):
             self.update()
             return
 
+        # ★ 手動で確定した固定矩形は「基準矩形」としても更新する
+        if is_fixed:
+            self.fixed_crop_rect_img_base = QtCore.QRect(rect_img)
+
         # 3) _crop_rect_img を更新（プレビューが古くならないように先に反映）
         try:
             self.mainwin._crop_rect_img = QtCore.QRect(rect_img)
@@ -3291,6 +3762,14 @@ class CropLabel(QtWidgets.QLabel):
                     except Exception:
                         pass
 
+
+                # ★ 非調整モードで手動移動した固定矩形も基準矩形として更新
+                try:
+                    if getattr(self, "fixed_crop_mode", False) and getattr(self, "fixed_crop_rect_img", None) is not None:
+                        self.fixed_crop_rect_img_base = QtCore.QRect(self.fixed_crop_rect_img)
+                except Exception:
+                    pass
+
                 # Nudge を復帰
                 _resume_nudge()
 
@@ -3440,6 +3919,7 @@ class CropLabel(QtWidgets.QLabel):
         self.fixed_crop_size = None
         self.fixed_crop_drag_offset = None
         self.fixed_crop_rect_img = None
+        self.fixed_crop_rect_img_base = None   # ★追加
         self.setCursor(QtCore.Qt.CursorShape.CrossCursor)
         self._hovering_fixed_rect = False
         self.update()
@@ -4923,35 +5403,14 @@ class CropperApp(QtWidgets.QMainWindow):
         self.sub_panel_layout = QtWidgets.QVBoxLayout(self.sub_panel)
         self.sub_panel_layout.setContentsMargins(12, 10, 12, 10)
 
-        # 解像度ラベル
-        self.crop_size_label = QtWidgets.QLabel("0 x 0")
-        self.crop_size_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.crop_size_label.setStyleSheet("""
-            QLabel {
-                color: #222;
-                background: #fff;
-                border: 1px solid #2c405a;
-                border-radius: 8px;
-                padding: 10px 20px;   /* ← フォント関連は消す */
-            }
-        """)
+        # 解像度ラベル（通常は表示、クリックでインライン編集）
+        self.crop_size_label = InlineCropSizeWidget(self)
+        self._crop_size_editing = False
 
-        # ← ここでフォントを“コードで”指定（pixel 単位が安全）
-        f = self.crop_size_label.font()
-        f.setPixelSize(32)
-        f.setBold(True)
-        # 好みで候補を並べる（最初に見つかったものが使われます）
-        try:
-            f.setFamilies(["Consolas", "Cascadia Mono", "Source Code Pro", "Meiryo", "Monospace"])
-        except AttributeError:
-            f.setFamily("Consolas")  # Qt の古い版向けフォールバック
-        self.crop_size_label.setFont(f)
-
-        # ---- このフォントで必要幅を計算 ----
-        fm = QtGui.QFontMetrics(self.crop_size_label.font())
-        reserve = fm.horizontalAdvance("99999 x 99999")  # 想定最大桁ぶん確保
-        padding_lr = 40  # QSSの左右padding 20px×2
-        self.crop_size_label.setFixedWidth(reserve + padding_lr + 2)
+        self.crop_size_label.editStarted.connect(self._on_crop_size_edit_started)
+        self.crop_size_label.editFinished.connect(self._on_crop_size_edit_finished)
+        self.crop_size_label.sizeConfirmed.connect(self._on_crop_size_inline_confirmed)
+        self._update_crop_size_edit_enabled()
 
         # ★ 画像の水平反転ボタン（2行表示＆正方形）
         self.btn_flip_horizontal = QtWidgets.QPushButton("水平\n反転")
@@ -7201,11 +7660,49 @@ class CropperApp(QtWidgets.QMainWindow):
         self._preserve_ui_on_next_load = None
         log_debug(f"[open] preserve={type(preserve).__name__} -> {preserve}")
 
+        if isinstance(preserve, dict):
+            log_debug("[open] incoming preserve =", preserve)
+            log_debug("[open] incoming post_save_overlay_rect_img =", preserve.get("post_save_overlay_rect_img"))
+            log_debug("[open] incoming post_save_original_fixed_rect_img =", preserve.get("post_save_original_fixed_rect_img"))
+            log_debug("[open] incoming post_save_preview_rect_img =", preserve.get("post_save_preview_rect_img"))
+
         # ★ 追加：一発トークンが空でも“粘着”から復元
         if preserve is None:
-            preserve = getattr(self, "_nav_chain_state", None)
-            if preserve is not None:
-                log_debug(f"[open] preserve <- chain = {preserve}")
+            chain = getattr(self, "_nav_chain_state", None)
+
+            # ★ fixed が今生きている時は、古い adjust/no_rect チェーンをそのまま使わない
+            fixed_alive = bool(
+                getattr(self.label, "fixed_crop_mode", False)
+                and getattr(self.label, "fixed_crop_rect_img", None) is not None
+            )
+
+            if isinstance(chain, dict):
+                if fixed_alive and chain.get("no_rect"):
+                    # ★ 無視して終わりではなく、今生きている fixed/adjust 状態から preserve を作る
+                    try:
+                        snap = self._snapshot_adjust_state()
+                    except Exception:
+                        snap = None
+
+                    if isinstance(snap, dict):
+                        preserve = dict(snap)
+                    else:
+                        preserve = {
+                            "adjust": bool(chain.get("adjust", False)),
+                            "panel_visible": bool(chain.get("panel_visible", False)),
+                            "fixed": True,
+                            "aspect_lock": bool(chain.get("aspect_lock", False)),
+                            "aspect_base": chain.get("aspect_base", None),
+                            "nudge": bool(chain.get("nudge", False)),
+                        }
+
+                    preserve.pop("no_rect", None)
+                    preserve["fixed"] = True
+
+                    log_debug(f"[open] preserve <- live fixed snapshot = {preserve}")
+                else:
+                    preserve = chain
+                    log_debug(f"[open] preserve <- chain = {preserve}")
 
         # === 2) 保存先ダイアログ抑止（この1回だけ） ===
         skip_save_prompt = False
@@ -7322,7 +7819,7 @@ class CropperApp(QtWidgets.QMainWindow):
                 # 返り値が None の場合は“失敗扱い”にする（←ココ修正ポイント）
                 r = self._restore_adjust_state(preserve_dict)
                 restored = bool(r)
-                log_debug(f"[open] _restore_adjust_state -> {r} (as {restored})")
+                log_debug(f"[open] _restore_adjust_state called, return={r!r}")
             except Exception as e:
                 log_debug(f"[open] _restore_adjust_state error: {e}")
                 restored = False
@@ -7358,27 +7855,66 @@ class CropperApp(QtWidgets.QMainWindow):
             prev_fixed = False
             prev_rect_img = None
             if isinstance(preserve, dict):
-                # 固定枠が有効ならそれを最優先
-                if getattr(self.label, "fixed_crop_mode", False) and getattr(self.label, "fixed_crop_rect_img", None):
+                log_debug("[open/light] incoming preserve =", preserve)
+                log_debug("[open/light] prev_fixed initial =", prev_fixed)
+                log_debug(
+                    "[open/light] label fixed rect initial =",
+                    tuple(self.label.fixed_crop_rect_img.getRect())
+                    if getattr(self.label, "fixed_crop_rect_img", None) is not None else None
+                )
+
+                # 固定枠が有効なら base 優先で使う
+                base_fixed = getattr(self.label, "fixed_crop_rect_img_base", None)
+                cur_fixed  = getattr(self.label, "fixed_crop_rect_img", None)
+
+                if getattr(self.label, "fixed_crop_mode", False) and (base_fixed is not None or cur_fixed is not None):
                     prev_fixed = True
-                    prev_rect_img = QtCore.QRect(self.label.fixed_crop_rect_img)
+                    prev_rect_img = QtCore.QRect(base_fixed or cur_fixed)
                 else:
-                    # 自由矩形
                     tmp = getattr(self, "_crop_rect_img", None)
                     prev_rect_img = _safe_qrect(tmp, fmt="xywh") if tmp is not None else QtCore.QRect()
                     if (prev_rect_img is None or prev_rect_img.isNull()) and getattr(self.label, "drag_rect_img", None):
                         prev_rect_img = _safe_qrect(self.label.drag_rect_img, fmt="xywh")
 
-                # ★ 保存直後だけは「左上に再配置した矩形」を優先する
                 try:
+                    log_debug(
+                        "[open/light] label fixed rect base =",
+                        tuple(self.label.fixed_crop_rect_img_base.getRect())
+                        if getattr(self.label, "fixed_crop_rect_img_base", None) is not None else None
+                    )
+                except Exception as e:
+                    log_debug("[open/light] label fixed rect base read error:", e)
+
+                try:
+                    log_debug(
+                        "[open/light] prev_rect_img before post overlay =",
+                        tuple(prev_rect_img.getRect()) if (prev_rect_img is not None and not prev_rect_img.isNull()) else None
+                    )
+                    log_debug("[open/light] prev_fixed before post overlay =", prev_fixed)
+
                     post_overlay = preserve.get("post_save_overlay_rect_img")
+                    log_debug("[open/light] post_save_overlay_rect_img =", post_overlay)
+                    log_debug("[open/light] post_save_original_fixed_rect_img =", preserve.get("post_save_original_fixed_rect_img"))
+                    log_debug("[open/light] post_save_preview_rect_img =", preserve.get("post_save_preview_rect_img"))
+
                     if post_overlay is not None:
                         r = _safe_qrect(post_overlay, fmt="xywh")
+                        log_debug(
+                            "[open/light] parsed post overlay rect =",
+                            tuple(r.getRect()) if (r is not None and not r.isNull()) else None
+                        )
                         if r and not r.isNull():
                             prev_rect_img = QtCore.QRect(r)
                             prev_fixed = bool(preserve.get("post_save_fixed", prev_fixed))
-                except Exception:
-                    pass
+
+                    log_debug(
+                        "[open/light] prev_rect_img after post overlay =",
+                        tuple(prev_rect_img.getRect()) if (prev_rect_img is not None and not prev_rect_img.isNull()) else None
+                    )
+                    log_debug("[open/light] prev_fixed after post overlay =", prev_fixed)
+
+                except Exception as e:
+                    log_debug("[open/light] post overlay read error:", repr(e))
 
             # --- preserve が None のときだけ UI をクリア ---
             self._suspend_chain_clear += 1
@@ -7397,12 +7933,10 @@ class CropperApp(QtWidgets.QMainWindow):
                     except Exception:
                         pass
 
-                # --- 画像だけ再読込 ---
                 self.load_image_by_index(self.current_index)
             finally:
                 self._suspend_chain_clear -= 1
 
-            # --- サムネ選択同期（パス一致で安全に） ---
             try:
                 self._sync_thumb_selection(
                     ensure_visible=focus_in_browser,
@@ -7410,9 +7944,32 @@ class CropperApp(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-            # --- ★ 復元：まず _restore_adjust_state、ダメなら“読み込み前スナップショット”で復元 ★ ---
             if isinstance(preserve, dict):
                 _try_restore(preserve, fallback_rect_img=prev_rect_img, fallback_fixed=prev_fixed)
+
+                # ★ fixed を復元したら、次回ナビ用の base も復元前の矩形で戻す
+                try:
+                    if prev_fixed and prev_rect_img is not None and not prev_rect_img.isNull():
+                        self.label.fixed_crop_rect_img_base = QtCore.QRect(prev_rect_img)
+                        log_debug(
+                            "[open/light] restored fixed rect base =",
+                            tuple(self.label.fixed_crop_rect_img_base.getRect())
+                        )
+                except Exception as e:
+                    log_debug("[open/light] restore fixed rect base error:", repr(e))
+
+                # ★ 保存直後 reopen 用の rich preserve は、次の1回のナビにも残す
+                try:
+                    if (
+                        preserve.get("post_save_overlay_rect_img") is not None
+                        or preserve.get("post_save_original_fixed_rect_img") is not None
+                        or preserve.get("post_save_preview_rect_img") is not None
+                    ):
+                        self._nav_chain_state = dict(preserve)
+                        log_debug("[open/light] keep rich preserve for next nav =", self._nav_chain_state)
+                except Exception as e:
+                    log_debug("[open/light] keep rich preserve error:", repr(e))
+
                 self._preserve_ui_on_next_load = None
 
             try:
@@ -7420,7 +7977,6 @@ class CropperApp(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-            # ★ 画像表示に切り替わるので、プレースホルダ状態を完全解除
             self._placeholder_active = False
             self._placeholder_selected = False
             self._placeholder_hit_rect = None
@@ -7600,14 +8156,38 @@ class CropperApp(QtWidgets.QMainWindow):
             fallback_fixed = False
             fallback_rect = None
 
+            log_debug("[open/heavy] incoming preserve =", preserve)
+
             try:
+                log_debug(
+                    "[open/heavy] fallback_rect before post overlay =",
+                    tuple(fallback_rect.getRect()) if (fallback_rect is not None and not fallback_rect.isNull()) else None
+                )
+                log_debug("[open/heavy] fallback_fixed before post overlay =", fallback_fixed)
+
                 post_overlay = preserve.get("post_save_overlay_rect_img")
+                log_debug("[open/heavy] post_save_overlay_rect_img =", post_overlay)
+                log_debug("[open/heavy] post_save_original_fixed_rect_img =", preserve.get("post_save_original_fixed_rect_img"))
+                log_debug("[open/heavy] post_save_preview_rect_img =", preserve.get("post_save_preview_rect_img"))
+
                 if post_overlay is not None:
                     r = _safe_qrect(post_overlay, fmt="xywh")
+                    log_debug(
+                        "[open/heavy] parsed post overlay rect =",
+                        tuple(r.getRect()) if (r is not None and not r.isNull()) else None
+                    )
                     if r and not r.isNull():
                         fallback_rect = QtCore.QRect(r)
                         fallback_fixed = bool(preserve.get("post_save_fixed", False))
-            except Exception:
+
+                log_debug(
+                    "[open/heavy] fallback_rect after post overlay =",
+                    tuple(fallback_rect.getRect()) if (fallback_rect is not None and not fallback_rect.isNull()) else None
+                )
+                log_debug("[open/heavy] fallback_fixed after post overlay =", fallback_fixed)
+
+            except Exception as e:
+                log_debug("[open/heavy] post overlay read error:", repr(e))
                 fallback_rect = None
                 fallback_fixed = False
 
@@ -7625,6 +8205,19 @@ class CropperApp(QtWidgets.QMainWindow):
                         fallback_rect = _safe_qrect(self.label.drag_rect_img, fmt="xywh")
 
             _try_restore(preserve, fallback_rect_img=fallback_rect, fallback_fixed=fallback_fixed)
+
+            # ★ 保存直後 reopen 用の rich preserve は、次の1回のナビにも残す
+            try:
+                if (
+                    preserve.get("post_save_overlay_rect_img") is not None
+                    or preserve.get("post_save_original_fixed_rect_img") is not None
+                    or preserve.get("post_save_preview_rect_img") is not None
+                ):
+                    self._nav_chain_state = dict(preserve)
+                    log_debug("[open/heavy] keep rich preserve for next nav =", self._nav_chain_state)
+            except Exception as e:
+                log_debug("[open/heavy] keep rich preserve error:", repr(e))
+
             self._preserve_ui_on_next_load = None
         try:
             self._update_nav_buttons()   # ★ ↑/戻る/進むの活性を更新
@@ -8777,6 +9370,40 @@ class CropperApp(QtWidgets.QMainWindow):
         except Exception:
             snap = None
 
+        # ★ 追加:
+        # 保存直後の reopen で仕込んだ一時情報を、次のナビ準備でも見えるように合成する
+        preserve_seed = {}
+        try:
+            cur_preserve = getattr(self, "_preserve_ui_on_next_load", None)
+            if isinstance(cur_preserve, dict):
+                preserve_seed.update(cur_preserve)
+        except Exception:
+            pass
+
+        try:
+            chain_preserve = getattr(self, "_nav_chain_state", None)
+            if isinstance(chain_preserve, dict):
+                preserve_seed.update(chain_preserve)
+        except Exception:
+            pass
+
+        if isinstance(snap, dict):
+            preserve_seed.update(snap)
+            snap = preserve_seed
+        elif preserve_seed:
+            snap = preserve_seed
+
+        log_debug("[nav] snap merged =", snap)
+        log_debug("[nav] current _preserve_ui_on_next_load =", getattr(self, "_preserve_ui_on_next_load", None))
+        log_debug("[nav] current _nav_chain_state =", getattr(self, "_nav_chain_state", None))
+        try:
+            log_debug(
+                "[nav] current fixed rect =",
+                tuple(lbl.fixed_crop_rect_img.getRect()) if (lbl and getattr(lbl, "fixed_crop_rect_img", None) is not None) else None,
+            )
+        except Exception as e:
+            log_debug("[nav] current fixed rect read error:", e)
+
         # ★ここがポイント：スナップが空でも _adjust_mode を見る
         fixed_on  = bool(lbl and getattr(lbl, "fixed_crop_mode", False))
         adjust_on = bool((snap and snap.get("adjust")) or getattr(self, "_adjust_mode", False))
@@ -8786,9 +9413,74 @@ class CropperApp(QtWidgets.QMainWindow):
         # 1) 固定枠はスナップショット優先でそのまま持ち越し
         if fixed_on and _meaningful(snap):
             preserve = dict(snap)
-            preserve.pop("no_rect", None)  # 念のため消しておく（固定は枠も復元）
-            # ★追加：Nudgeの可視を明示的に持ち越し
+            preserve.pop("no_rect", None)
             preserve["nudge"] = bool(getattr(self, "_nudge_overlay", None) and self._nudge_overlay.isVisible())
+
+            try:
+                cur_fixed = (
+                    getattr(lbl, "fixed_crop_rect_img_base", None)
+                    or getattr(lbl, "fixed_crop_rect_img", None)
+                )
+                pending_overlay = preserve.get("post_save_overlay_rect_img")
+                pending_original = preserve.get("post_save_original_fixed_rect_img")
+
+                cur_rect = QtCore.QRect(cur_fixed) if cur_fixed is not None else QtCore.QRect()
+                overlay_rect = _safe_qrect(pending_overlay, fmt="xywh") if pending_overlay is not None else QtCore.QRect()
+                original_rect = _safe_qrect(pending_original, fmt="xywh") if pending_original is not None else QtCore.QRect()
+
+                log_debug("[nav/fixed] preserve before adjust =", preserve)
+                log_debug("[nav/fixed] pending_overlay =", pending_overlay)
+                log_debug("[nav/fixed] pending_original =", pending_original)
+                log_debug("[nav/fixed] cur_rect =", tuple(cur_rect.getRect()) if not cur_rect.isNull() else None)
+                log_debug("[nav/fixed] overlay_rect =", tuple(overlay_rect.getRect()) if not overlay_rect.isNull() else None)
+                log_debug("[nav/fixed] original_rect =", tuple(original_rect.getRect()) if not original_rect.isNull() else None)
+                log_debug(
+                    "[nav/fixed] compare =",
+                    {
+                        "cur==overlay": (not cur_rect.isNull() and not overlay_rect.isNull() and cur_rect == overlay_rect),
+                        "has_original": (not original_rect.isNull()),
+                    }
+                )
+
+                if (
+                    not cur_rect.isNull()
+                    and not overlay_rect.isNull()
+                    and cur_rect == overlay_rect
+                    and not original_rect.isNull()
+                ):
+                    log_debug("[nav/fixed] use original fixed rect for next image")
+
+                    preserve["post_save_overlay_rect_img"] = (
+                        int(original_rect.x()),
+                        int(original_rect.y()),
+                        int(original_rect.width()),
+                        int(original_rect.height()),
+                    )
+                    preserve.pop("post_save_preview_rect_img", None)
+
+                elif (
+                    not cur_rect.isNull()
+                    and not overlay_rect.isNull()
+                    and not original_rect.isNull()
+                    and overlay_rect == original_rect
+                    and cur_rect.x() == 0
+                    and cur_rect.y() == 0
+                    and cur_rect.width() == original_rect.width()
+                    and cur_rect.height() == original_rect.height()
+                ):
+                    # ★ 1回目の prepare 後、まだ実画面が左上仮矩形のままな自動遷移だけ keep
+                    log_debug("[nav/fixed] keep already-converted rich preserve")
+
+                else:
+                    log_debug("[nav/fixed] discard post-save temporary state")
+
+                    preserve.pop("post_save_overlay_rect_img", None)
+                    preserve.pop("post_save_preview_rect_img", None)
+                    preserve.pop("post_save_original_fixed_rect_img", None)
+                    preserve.pop("post_save_fixed", None)
+
+            except Exception as e:
+                log_debug("[nav/fixed] exception =", repr(e))
 
             self._preserve_ui_on_next_load = preserve
             self._nav_chain_state = preserve
@@ -8990,18 +9682,25 @@ class CropperApp(QtWidgets.QMainWindow):
         elif idx - 1 >= 0:
             next_path = self.image_list[idx - 1]
 
-        # ① ファイル削除
+        # ① 削除前に、現在のUI状態を次回だけ温存する
+        try:
+            if hasattr(self, "_prepare_preserve_for_nav"):
+                self._prepare_preserve_for_nav()
+        except Exception:
+            pass
+
+        # ② ファイル削除
         try:
             os.remove(file_path)
         except Exception as e:
             QMessageBox.warning(self, "削除エラー", f"ファイルの削除に失敗しました:\n{e}")
             return
 
-        # ② フォルダを開き直してモデルをリセット（_gen を進めて遅延ジョブを無効化）
+        # ③ フォルダを開き直してモデルをリセット（_gen を進めて遅延ジョブを無効化）
         cur_dir = getattr(self, "folder", os.path.dirname(file_path))
         self.open_folder(cur_dir, _src="delete")
 
-        # ③ 可能なら削除前に決めておいた候補画像にフォーカスを戻す
+        # ④ 可能なら削除前に決めておいた候補画像にフォーカスを戻す
         if next_path and os.path.exists(next_path):
             try:
                 self.current_index = self.image_list.index(next_path)
@@ -9012,28 +9711,36 @@ class CropperApp(QtWidgets.QMainWindow):
                     if os.path.normcase(os.path.abspath(p)) == norm),
                     -1
                 )
+
             if self.current_index >= 0:
-                self.load_image_by_index(self.current_index)
+                try:
+                    # ★ load_image_by_index ではなく、preserve ルートの open_image_from_path を使う
+                    self.open_image_from_path(self.image_list[self.current_index], focus_in_browser=True)
+                except Exception:
+                    self.load_image_by_index(self.current_index)
+
                 try:
                     self._sync_thumb_selection()
                 except Exception:
                     pass
                 return
 
-        # ④ 候補が無い/見つからない場合のフォールバック
+        # ⑤ 候補が無い/見つからない場合のフォールバック
         if not self.image_list:
-            # 画像がもう無ければプレースホルダ
             self._set_preview_placeholder()
             self._set_progress_visible(False)
         else:
-            # フォルダ再読込後の最寄りインデックスを安全に表示
             self.current_index = max(0, min(idx, len(self.image_list) - 1))
-            self.load_image_by_index(self.current_index)
+            try:
+                self.open_image_from_path(self.image_list[self.current_index], focus_in_browser=True)
+            except Exception:
+                self.load_image_by_index(self.current_index)
+
             try:
                 self._sync_thumb_selection()
             except Exception:
                 pass
-
+    
     def _update_nav_buttons(self):
         # 履歴が無ければ初期化
         if not hasattr(self, "_nav_history"):
@@ -10105,13 +10812,18 @@ class CropperApp(QtWidgets.QMainWindow):
         if fixed_rect is not None:
             # 固定枠モードの矩形
             self.label.fixed_crop_rect_img = QtCore.QRect(fixed_rect)
+            # ★ 基準矩形 fixed_crop_rect_img_base は更新しない
+            self.label.drag_rect_img = None
             self._crop_rect_img = QtCore.QRect(fixed_rect)
         elif drag_rect is not None:
             # 通常ドラッグの矩形
             self.label.drag_rect_img = QtCore.QRect(drag_rect)
+            self.label.fixed_crop_rect_img = None
             self._crop_rect_img = QtCore.QRect(drag_rect)
         else:
             # 念のため _crop_rect_img だけ生きているケースも反転
+            self.label.fixed_crop_rect_img = None
+            self.label.drag_rect_img = None
             self._crop_rect_img = QtCore.QRect(crop_rect) if crop_rect is not None else None
 
         # 3) ピクスマップ再生成 & 再描画
@@ -10190,13 +10902,18 @@ class CropperApp(QtWidgets.QMainWindow):
         if fixed_rect is not None:
             # 固定枠モードの矩形
             self.label.fixed_crop_rect_img = QtCore.QRect(fixed_rect)
+            # ★ 基準矩形 fixed_crop_rect_img_base は更新しない
+            self.label.drag_rect_img = None
             self._crop_rect_img = QtCore.QRect(fixed_rect)
         elif drag_rect is not None:
             # 通常ドラッグの矩形
             self.label.drag_rect_img = QtCore.QRect(drag_rect)
+            self.label.fixed_crop_rect_img = None
             self._crop_rect_img = QtCore.QRect(drag_rect)
         else:
             # 念のため _crop_rect_img だけ生きているケースも反転
+            self.label.fixed_crop_rect_img = None
+            self.label.drag_rect_img = None
             self._crop_rect_img = QtCore.QRect(crop_rect) if crop_rect is not None else None
 
         # 3) ピクスマップ再生成 & 再描画
@@ -10311,6 +11028,7 @@ class CropperApp(QtWidgets.QMainWindow):
         # --- 回転後の矩形を書き戻し ---
         if new_fixed is not None:
             self.label.fixed_crop_rect_img = QtCore.QRect(new_fixed)
+            # ★ 基準矩形 fixed_crop_rect_img_base は更新しない
             self.label.drag_rect_img = None
             self._crop_rect_img = QtCore.QRect(new_fixed)
         elif new_drag is not None:
@@ -11937,6 +12655,23 @@ class CropperApp(QtWidgets.QMainWindow):
                         except Exception:
                             state = {"rect": "full"}
 
+                        # ★ 追加: 保存前の“本来の固定矩形”を退避しておく
+                        try:
+                            base_fixed = (
+                                getattr(self.label, "fixed_crop_rect_img_base", None)
+                                or getattr(self.label, "fixed_crop_rect_img", None)
+                            )
+
+                            if getattr(self.label, "fixed_crop_mode", False) and base_fixed is not None:
+                                state["post_save_original_fixed_rect_img"] = (
+                                    int(base_fixed.x()),
+                                    int(base_fixed.y()),
+                                    int(base_fixed.width()),
+                                    int(base_fixed.height()),
+                                )
+                        except Exception:
+                            pass
+
                         # ★ 保存後は、矩形表示用とプレビュー用で別の矩形を持たせる
                         try:
                             saved_preview_w = max(0, int(right - left))
@@ -11956,6 +12691,16 @@ class CropperApp(QtWidgets.QMainWindow):
                             )
                         except Exception:
                             pass
+
+                        log_debug("[save] reopen state =", state)
+                        try:
+                            log_debug(
+                                "[save] fixed now =",
+                                bool(getattr(self.label, "fixed_crop_mode", False)),
+                                tuple(self.label.fixed_crop_rect_img.getRect()) if getattr(self.label, "fixed_crop_rect_img", None) is not None else None,
+                            )
+                        except Exception as e:
+                            log_debug("[save] fixed now read error:", e)
 
                         self._preserve_ui_on_next_load = state
 
@@ -12564,7 +13309,8 @@ class CropperApp(QtWidgets.QMainWindow):
 
         self.label.fixed_crop_mode = True
         self.label.fixed_crop_size = (w, h)
-        self.label.fixed_crop_rect_img = QtCore.QRect(img_rect)  # 画像座標で保持
+        self.label.fixed_crop_rect_img = QtCore.QRect(img_rect)        # 画像座標で保持
+        self.label.fixed_crop_rect_img_base = QtCore.QRect(img_rect)   # ★基準矩形もここで初期化
 
         # --- 固定化サイズをカスタムサイズに同期し、トグルONにする ---
         self.custom_size = (w, h)
@@ -12799,18 +13545,29 @@ class CropperApp(QtWidgets.QMainWindow):
         width_edit.setPlaceholderText("幅 (例: 1024)")
         height_edit.setPlaceholderText("高さ (例: 768)")
 
+        # ★ 追加: 半角数字1～4桁のみ許可（全角不可）
+        rx_validator = QtGui.QRegularExpressionValidator(
+            QtCore.QRegularExpression(r"[0-9]{1,4}")
+        )
+        width_edit.setValidator(rx_validator)
+        height_edit.setValidator(rx_validator)
+
         if self.custom_size:
             try:
                 w, h = self.custom_size
-                width_edit.setText(str(w)); height_edit.setText(str(h))
+                width_edit.setText(str(w))
+                height_edit.setText(str(h))
             except Exception:
                 pass
 
-        layout.addWidget(QtWidgets.QLabel("幅:"));    layout.addWidget(width_edit)
-        layout.addWidget(QtWidgets.QLabel("高さ:"));  layout.addWidget(height_edit)
+        layout.addWidget(QtWidgets.QLabel("幅:"))
+        layout.addWidget(width_edit)
+        layout.addWidget(QtWidgets.QLabel("高さ:"))
+        layout.addWidget(height_edit)
 
         btn_box = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+            QtWidgets.QDialogButtonBox.StandardButton.Ok |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
         )
         layout.addWidget(btn_box)
         btn_box.accepted.connect(dialog.accept)
@@ -12818,23 +13575,96 @@ class CropperApp(QtWidgets.QMainWindow):
 
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             try:
-                w = int(width_edit.text()); h = int(height_edit.text())
-                if w > 0 and h > 0:
-                    self.custom_size = (w, h)
-                    self.update_custom_edit_action_text()
+                w_text = width_edit.text()
+                h_text = height_edit.text()
 
-                    if self.custom_toggle_action.isChecked():
-                        # すでにON：ここでサイズを即反映（編集メニューから or トグル経由）
-                        if hasattr(self, "crop_actions"):
-                            for act in self.crop_actions.values():
-                                act.setChecked(False)
-                        self.fixed_crop_triggered(self.custom_size, True)
-                    else:
-                        # OFF → ON に切り替え（適用は on_custom_toggle 側で実施）
-                        self.custom_toggle_action.setChecked(True)
+                # ★ 空欄不可 / 半角数字のみ / 1～4桁
+                if (not re.fullmatch(r"[0-9]{1,4}", w_text) or
+                    not re.fullmatch(r"[0-9]{1,4}", h_text)):
+                    return
+
+                w = int(w_text)
+                h = int(h_text)
+
+                # ★ 1以上 / 上限9999
+                if not (1 <= w <= 9999 and 1 <= h <= 9999):
+                    return
+
+                self.custom_size = (w, h)
+                self.update_custom_edit_action_text()
+
+                if self.custom_toggle_action.isChecked():
+                    # すでにON：ここでサイズを即反映
+                    if hasattr(self, "crop_actions"):
+                        for act in self.crop_actions.values():
+                            act.setChecked(False)
+
+                    # 念のため checked 状態は保ったまま反映
+                    blocker = QtCore.QSignalBlocker(self.custom_toggle_action)
+                    self.custom_toggle_action.setChecked(True)
+                    del blocker
+
+                    self.fixed_crop_triggered(self.custom_size, True)
+                else:
+                    # OFF → ON に切り替え（適用は on_custom_toggle 側で実施）
+                    self.custom_toggle_action.setChecked(True)
+
             except Exception:
                 pass
         # Cancel：何もしない
+
+    def _on_crop_size_edit_started(self):
+        self._crop_size_editing = True
+
+    def _on_crop_size_edit_finished(self):
+        self._crop_size_editing = False
+
+    def _on_crop_size_inline_confirmed(self, w: int, h: int):
+        new_size = (int(w), int(h))
+        self.custom_size = new_size
+        self.update_custom_edit_action_text()
+
+        # ★ 追加:
+        # すでに同じ固定サイズが有効なら、再適用も解除もせず何もしない
+        try:
+            if (
+                getattr(self.label, "fixed_crop_mode", False)
+                and getattr(self.label, "fixed_crop_size", None) == new_size
+            ):
+                return
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "crop_actions"):
+                for act in self.crop_actions.values():
+                    act.setChecked(False)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "custom_toggle_action"):
+                blocker = QtCore.QSignalBlocker(self.custom_toggle_action)
+                self.custom_toggle_action.setChecked(True)
+                del blocker
+        except Exception:
+            pass
+
+        self.fixed_crop_triggered(self.custom_size, True)
+
+    def _rect_size_for_label(self, rect, img_space=False):
+        if rect is None:
+            return (0, 0)
+
+        try:
+            w = int(rect.width())
+            h = int(rect.height())
+        except Exception:
+            return (0, 0)
+
+        # QRect の right/bottom を使っている系で 1px 差が出る場合だけここで調整したければ調整
+        # 今の既存表示と揃えたいなら、このまま width()/height() を使う
+        return (max(0, w), max(0, h))
       
     def cancel_crop(self):
         # --- 1) 独立Nudge(オーバーレイ)は閉じる ---
@@ -13145,8 +13975,13 @@ class CropperApp(QtWidgets.QMainWindow):
         - False なら rect はラベル座標なので画像座標に変換
         何も来なければ fixed_crop_rect_img → drag_rect_img の順で拾う。
         """
+        # ★ 編集中はリアルタイム更新を止める
+        if getattr(self, "_crop_size_editing", False):
+            return
+
         if not getattr(self, "image", None):
-            self.crop_size_label.setText("0 x 0")
+            self.crop_size_label.set_display_size(0, 0)
+            self._update_crop_size_edit_enabled()
             return
 
         img_w, img_h = self.image.width, self.image.height
@@ -13162,13 +13997,19 @@ class CropperApp(QtWidgets.QMainWindow):
                 x2, y2 = rect.left() + rect.width(), rect.top() + rect.height()
                 gx1, gy1 = self.label.label_to_image_coords(x1, y1)
                 gx2, gy2 = self.label.label_to_image_coords(x2, y2)
-                img_rect = QtCore.QRect(min(gx1, gx2), min(gy1, gy2), abs(gx2 - gx1), abs(gy2 - gy1))
+                img_rect = QtCore.QRect(
+                    min(gx1, gx2),
+                    min(gy1, gy2),
+                    abs(gx2 - gx1),
+                    abs(gy2 - gy1)
+                )
         elif getattr(self.label, "fixed_crop_rect_img", None) is not None:
             img_rect = self.label.fixed_crop_rect_img
         elif getattr(self.label, "drag_rect_img", None) is not None:
             img_rect = self.label.drag_rect_img
         else:
-            self.crop_size_label.setText("0 x 0")
+            self.crop_size_label.set_display_size(0, 0)
+            self._update_crop_size_edit_enabled()
             return
 
         # 2) 保存処理と同じ正規化＆クリップ
@@ -13188,11 +14029,20 @@ class CropperApp(QtWidgets.QMainWindow):
 
         # ★ どちらかが 0 なら完全に非選択とみなし、見た目を揃える
         if crop_w == 0 or crop_h == 0:
-            self.crop_size_label.setText("0 x 0")
+            self.crop_size_label.set_display_size(0, 0)
+            self._update_crop_size_edit_enabled()
             return
 
         # --- それ以外 ---
-        self.crop_size_label.setText(f"{crop_w} x {crop_h}")
+        self.crop_size_label.set_display_size(crop_w, crop_h)
+        self._update_crop_size_edit_enabled()
+
+    def _update_crop_size_edit_enabled(self):
+        has_image = bool(getattr(self, "image", None))
+        try:
+            self.crop_size_label.set_edit_enabled(has_image)
+        except Exception:
+            pass
 
     def pan_image(self, dx, dy):
         # ラベルのオフセット値を変更
