@@ -52,7 +52,7 @@ except Exception:
     py7zr = None
 
 APP_NAME = "画像切り取りツール"
-APP_VERSION = "1.2.5" 
+APP_VERSION = "1.2.6" 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
@@ -2762,6 +2762,67 @@ class SaveDestinationDialog(QtWidgets.QDialog):
         self.setWindowTitle("保存先の選択")
         self.setModal(True)
 
+        self.setStyleSheet("""
+            QDialog {
+                background: #121212;
+                color: #e0e0e0;
+            }
+            QGroupBox {
+                border: 1px solid #ffffff;
+                border-radius: 6px;
+                margin-top: 4px;
+                color: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 6px;
+                color: #ffffff;
+            }
+            QRadioButton {
+                color: #ffffff;
+                background: transparent;
+            }
+            QCheckBox {
+                color: #ffffff;
+                background: transparent;
+            }
+            QLineEdit {
+                background: #1e1e1e;
+                color: #e0e0e0;
+                border: 1px solid #3a3a3a;
+                padding: 2px 4px;
+                selection-background-color: #2d6cdf;
+            }
+            QToolButton {
+                background: #555555;
+                color: #ffffff;
+                border: 1px solid #aaaaaa;
+                border-radius: 3px;
+                padding: 2px 6px;
+            }
+            QToolButton:hover:enabled {
+                background: #777777;
+            }
+            QToolButton:disabled {
+                background: #333333;
+                color: #777777;
+                border-color: #555555;
+            }
+            QDialogButtonBox QPushButton {
+                background: #2b2b2b;
+                color: #e0e0e0;
+                border: 1px solid #3a3a3a;
+                padding: 4px 10px;
+            }
+            QDialogButtonBox QPushButton:hover {
+                background: #333333;
+            }
+            QDialogButtonBox QPushButton:pressed {
+                background: #222222;
+            }
+        """)
+
         v = QtWidgets.QVBoxLayout(self)
 
         # --- 保存先 ---
@@ -2775,7 +2836,7 @@ class SaveDestinationDialog(QtWidgets.QDialog):
 
         self.edit_dir = QtWidgets.QLineEdit()
         self.btn_browse = QtWidgets.QToolButton()
-        self.btn_browse.setText("参照.")
+        self.btn_browse.setText("参照")
         self.edit_dir.setText(custom_dir or src_dir)
 
         gdest.addWidget(self.rad_same,   0, 0, 1, 3)
@@ -2786,8 +2847,8 @@ class SaveDestinationDialog(QtWidgets.QDialog):
         # --- 保存方法 ---
         grp_mode = QtWidgets.QGroupBox("保存方法")
         gmode = QtWidgets.QVBoxLayout(grp_mode)
-        self.rad_seq  = QtWidgets.QRadioButton("連番保存（既存ファイルは残す）")
-        self.rad_ow   = QtWidgets.QRadioButton("上書き保存")
+        self.rad_seq = QtWidgets.QRadioButton("連番保存（既存ファイルは残す）")
+        self.rad_ow = QtWidgets.QRadioButton("上書き保存")
         self.rad_ow.setChecked(bool(overwrite))
         self.rad_seq.setChecked(not bool(overwrite))
 
@@ -5300,7 +5361,9 @@ class InfoBanner(QtWidgets.QFrame):
         self._text_label.setFont(f)
 
         self._icon_label.setStyleSheet("background: transparent; border: none;")
-        self._text_label.setStyleSheet("background: transparent; border: none;")
+        self._text_label.setStyleSheet(
+            "color: #dddddd; background: transparent; border: none;"
+        )
 
         # レイアウト：左右に stretch は入れず、全体を中央寄せ
         lay = QtWidgets.QHBoxLayout(self)
@@ -5839,18 +5902,25 @@ class CropperApp(QtWidgets.QMainWindow):
             lambda on: self._on_quick_save_mode_changed(True)  if on else None
         )
 
-        # グループ共通の見た目
         group_style = """
             QGroupBox {
                 border: 1px solid #ffffff;
                 border-radius: 6px;
                 margin-top: 4px;
+                color: #ffffff;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 subcontrol-position: top left;
                 padding: 0 6px;
                 color: #ffffff;
+            }
+            QGroupBox QRadioButton {
+                color: #ffffff;
+                background: transparent;
+            }
+            QGroupBox QRadioButton:disabled {
+                color: #777777;
             }
         """
 
