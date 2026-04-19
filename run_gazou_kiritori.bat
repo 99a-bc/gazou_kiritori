@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 pushd "%~dp0"
 
 REM ============================================================
@@ -13,7 +13,7 @@ set "PYTHON=%~dp0venv\Scripts\python.exe"
 
 if not exist "%PYTHON%" (
     echo [error] venv Python not found:
-    echo %PYTHON%
+    echo !PYTHON!
     popd
     endlocal
     pause

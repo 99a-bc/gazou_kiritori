@@ -52,7 +52,7 @@ except Exception:
     py7zr = None
 
 APP_NAME = "画像切り取りツール"
-APP_VERSION = "1.2.4" 
+APP_VERSION = "1.2.5" 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
@@ -1368,6 +1368,102 @@ class _CropSizeDisplayLabel(QtWidgets.QLabel):
         )
         p.restore()
 
+class LastSavedSizeLabel(QtWidgets.QLabel):
+    clicked = QtCore.pyqtSignal()
+
+    def __init__(self, text="前回: 未保存", parent=None):
+        super().__init__(text, parent)
+        self._hover = False
+        self._enabled_click = False
+        self._flash = False
+
+        self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_Hover, True)
+        self.setMouseTracking(True)
+
+        f = self.font()
+        f.setPixelSize(18)
+        f.setBold(True)
+        try:
+            f.setFamilies(["Consolas", "Cascadia Mono", "Source Code Pro", "Meiryo", "Monospace"])
+        except AttributeError:
+            f.setFamily("Consolas")
+        self.setFont(f)
+
+        fm = QtGui.QFontMetrics(self.font())
+        reserve = fm.horizontalAdvance("前回: 9999 x 9999")
+        padding_lr = 24
+        self.setFixedWidth(reserve + padding_lr + 2)
+
+        self._flash_timer = QtCore.QTimer(self)
+        self._flash_timer.setSingleShot(True)
+        self._flash_timer.timeout.connect(self._clear_flash)
+
+        self._apply_style()
+
+    def _clear_flash(self):
+        self._flash = False
+        self._apply_style()
+
+    def flash_applied(self):
+        self._flash = True
+        self._apply_style()
+        self._flash_timer.stop()
+        self._flash_timer.start(220)
+
+    def set_apply_enabled(self, enabled: bool):
+        self._enabled_click = bool(enabled)
+        if self._enabled_click:
+            self.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        else:
+            self.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.ArrowCursor))
+        self._apply_style()
+
+    def _apply_style(self):
+        if not self._enabled_click:
+            border = "#5a5a5a"
+            bg = "#d9d9d9"
+            fg = "#666666"
+        elif self._flash:
+            border = "#7fb2ff"
+            bg = "#eef5ff"
+            fg = "#1f2d3d"
+        elif self._hover:
+            border = "#7fb2ff"
+            bg = "#ffffff"
+            fg = "#222222"
+        else:
+            border = "#2c405a"
+            bg = "#f4f4f4"
+            fg = "#222222"
+
+        self.setStyleSheet(f"""
+            QLabel {{
+                color: {fg};
+                background: {bg};
+                border: 1px solid {border};
+                border-radius: 8px;
+                padding: 6px 12px;
+            }}
+        """)
+
+    def enterEvent(self, event):
+        self._hover = True
+        self._apply_style()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self._apply_style()
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._enabled_click and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
 class _CropSizeLineEdit(QtWidgets.QLineEdit):
     enterPressed = QtCore.pyqtSignal()
     escapePressed = QtCore.pyqtSignal()
@@ -1398,6 +1494,7 @@ class InlineCropSizeWidget(QtWidgets.QFrame):
         self._last_text = "0 x 0"
         self._edit_target_side = "left"   # ★ 追加
         self._edit_enabled = True
+        self._suppress_next_outside_commit = False
 
         self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
 
@@ -1649,7 +1746,6 @@ class InlineCropSizeWidget(QtWidgets.QFrame):
         if not self._editing:
             return
 
-        # 編集UI内部の移動（幅→高さ など）は無視
         if now is not None:
             cur = now
             while cur is not None:
@@ -1657,7 +1753,10 @@ class InlineCropSizeWidget(QtWidgets.QFrame):
                     return
                 cur = cur.parentWidget()
 
-        # 編集UIの外へ出た → 確定（不正なら内部でキャンセル）
+        if self._suppress_next_outside_commit:
+            self._suppress_next_outside_commit = False
+            return
+
         QtCore.QTimer.singleShot(0, self.commit_edit)
 
     def eventFilter(self, obj, event):
@@ -1666,18 +1765,29 @@ class InlineCropSizeWidget(QtWidgets.QFrame):
 
         if event.type() == QtCore.QEvent.Type.MouseButtonPress:
             try:
-                # クリック位置（グローバル座標）
+                app = QtWidgets.QApplication.instance()
+
                 if hasattr(event, "globalPosition"):
                     gp = event.globalPosition().toPoint()
                 else:
                     gp = event.globalPos()
 
-                # editor_host の画面上矩形
+                # ★ 前回保存ラベルへのクリックは「外クリック確定」にしない
+                hit = app.widgetAt(gp) if app is not None else None
+                cur = hit
+                while cur is not None:
+                    if isinstance(cur, LastSavedSizeLabel):
+                        return super().eventFilter(obj, event)
+                    cur = cur.parentWidget()
+
                 top_left = self.editor_host.mapToGlobal(QtCore.QPoint(0, 0))
                 rect = QtCore.QRect(top_left, self.editor_host.size())
 
-                # 編集ボックス外クリックなら確定
                 if not rect.contains(gp):
+                    if self._suppress_next_outside_commit:
+                        self._suppress_next_outside_commit = False
+                        return super().eventFilter(obj, event)
+
                     QtCore.QTimer.singleShot(0, self.commit_edit)
             except Exception:
                 pass
@@ -1691,6 +1801,9 @@ class InlineCropSizeWidget(QtWidgets.QFrame):
         except Exception:
             pass
         super().closeEvent(event)
+
+    def suppress_next_outside_commit(self):
+        self._suppress_next_outside_commit = True
 
 class SquareLabel(QtWidgets.QLabel):
     def __init__(self, parent=None, min_side=256, base_side=512):
@@ -5410,7 +5523,15 @@ class CropperApp(QtWidgets.QMainWindow):
         self.crop_size_label.editStarted.connect(self._on_crop_size_edit_started)
         self.crop_size_label.editFinished.connect(self._on_crop_size_edit_finished)
         self.crop_size_label.sizeConfirmed.connect(self._on_crop_size_inline_confirmed)
+
+        # 直近保存サイズラベル
+        self._last_saved_size = None  # (w, h) or None
+        self.last_saved_size_label = LastSavedSizeLabel("前回: 未保存", self)
+        self.last_saved_size_label.setToolTip("保存後に再利用できます")
+        self.last_saved_size_label.clicked.connect(self._on_last_saved_size_clicked)
+
         self._update_crop_size_edit_enabled()
+        self._set_last_saved_size(None)
 
         # ★ 画像の水平反転ボタン（2行表示＆正方形）
         self.btn_flip_horizontal = QtWidgets.QPushButton("水平\n反転")
@@ -5903,9 +6024,26 @@ class CropperApp(QtWidgets.QMainWindow):
         # 上側の余白
         self.sub_panel_layout.addStretch(2)
 
-        # 解像度ラベル（灰色エリアの中央に来る）
-        self.sub_panel_layout.addWidget(
+        # 解像度ラベル＋前回保存ラベル
+        self.size_label_wrap = QtWidgets.QWidget()
+        size_wrap_layout = QtWidgets.QVBoxLayout(self.size_label_wrap)
+        size_wrap_layout.setContentsMargins(0, 0, 0, 0)
+        size_wrap_layout.setSpacing(6)
+
+        size_wrap_layout.addWidget(
             self.crop_size_label,
+            alignment=QtCore.Qt.AlignmentFlag.AlignHCenter
+        )
+
+        last_row = QtWidgets.QHBoxLayout()
+        last_row.setContentsMargins(0, 0, 0, 0)
+        last_row.setSpacing(0)
+        last_row.addStretch(1)
+        last_row.addWidget(self.last_saved_size_label, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        size_wrap_layout.addLayout(last_row)
+
+        self.sub_panel_layout.addWidget(
+            self.size_label_wrap,
             alignment=QtCore.Qt.AlignmentFlag.AlignHCenter
         )
 
@@ -12729,6 +12867,11 @@ class CropperApp(QtWidgets.QMainWindow):
                     print("[thumb] invalidate request failed:", e)
 
                 saved_path = dst_path
+
+                try:
+                    self._update_last_saved_size_from_path(saved_path)
+                except Exception:
+                    pass
                 return True, saved_path
 
             # ========== 通常（連番保存） ==========
@@ -12761,6 +12904,11 @@ class CropperApp(QtWidgets.QMainWindow):
                 print("保存:", candidate)
 
             saved_path = candidate
+
+            try:
+                self._update_last_saved_size_from_path(saved_path)
+            except Exception:
+                pass
             return True, saved_path
 
         except Exception as e:
@@ -13142,6 +13290,11 @@ class CropperApp(QtWidgets.QMainWindow):
                 cropped.save(str(dst_path), **save_kwargs)
                 processed += 1
                 _log("[BATCH] saved OK", str(dst_path))
+
+                try:
+                    self._update_last_saved_size_from_path(str(dst_path))
+                except Exception:
+                    pass
 
                 # ★ 上書き時は“変更されたパス”を記録してサムネ更新に使う
                 if overwrite:
@@ -13624,14 +13777,25 @@ class CropperApp(QtWidgets.QMainWindow):
         self.custom_size = new_size
         self.update_custom_edit_action_text()
 
-        # ★ 追加:
-        # すでに同じ固定サイズが有効なら、再適用も解除もせず何もしない
         try:
             if (
                 getattr(self.label, "fixed_crop_mode", False)
                 and getattr(self.label, "fixed_crop_size", None) == new_size
             ):
-                return
+                if bool(getattr(self.label, "_aspect_lock", False)):
+                    try:
+                        self.label._aspect_base_wh = new_size
+                        self.label._aspect_ratio = float(new_size[0]) / float(new_size[1])
+                    except Exception:
+                        self.label._aspect_ratio = None
+
+                    try:
+                        panel = getattr(self, "_nudge_overlay", None)
+                        if panel and hasattr(panel, "update_aspect_base"):
+                            panel.update_aspect_base(new_size)
+                    except Exception:
+                        pass
+                    return
         except Exception:
             pass
 
@@ -13651,6 +13815,20 @@ class CropperApp(QtWidgets.QMainWindow):
             pass
 
         self.fixed_crop_triggered(self.custom_size, True)
+
+        if bool(getattr(self.label, "_aspect_lock", False)):
+            try:
+                self.label._aspect_base_wh = new_size
+                self.label._aspect_ratio = float(new_size[0]) / float(new_size[1])
+            except Exception:
+                self.label._aspect_ratio = None
+
+            try:
+                panel = getattr(self, "_nudge_overlay", None)
+                if panel and hasattr(panel, "update_aspect_base"):
+                    panel.update_aspect_base(new_size)
+            except Exception:
+                pass
 
     def _rect_size_for_label(self, rect, img_space=False):
         if rect is None:
@@ -13942,7 +14120,7 @@ class CropperApp(QtWidgets.QMainWindow):
                 except Exception:
                     self.label._aspect_ratio = None
                 # NudgePanel の表示（"基準: W×H"）も更新
-                panel = getattr(self, "_nudge_panel", None)
+                panel = getattr(self, "_nudge_overlay", None)
                 if panel and hasattr(panel, "update_aspect_base"):
                     panel.update_aspect_base(self.label._aspect_base_wh)
         except Exception:
@@ -14043,6 +14221,71 @@ class CropperApp(QtWidgets.QMainWindow):
             self.crop_size_label.set_edit_enabled(has_image)
         except Exception:
             pass
+
+        try:
+            self._update_last_saved_size_label_enabled()
+        except Exception:
+            pass
+
+    def _set_last_saved_size(self, size_tuple):
+        if size_tuple is None:
+            self._last_saved_size = None
+            self.last_saved_size_label.setText("前回: 未保存")
+        else:
+            w, h = map(int, size_tuple)
+            self._last_saved_size = (w, h)
+            self.last_saved_size_label.setText(f"前回: {w} x {h}")
+        self._update_last_saved_size_label_enabled()
+
+    def _update_last_saved_size_label_enabled(self):
+        has_image = bool(getattr(self, "image", None))
+        has_saved = self._last_saved_size is not None
+
+        enabled = has_image and has_saved
+        self.last_saved_size_label.set_apply_enabled(enabled)
+
+        if enabled:
+            self.last_saved_size_label.setToolTip("クリックでこのサイズを適用")
+        else:
+            self.last_saved_size_label.setToolTip("保存後に再利用できます")
+
+    def _update_last_saved_size_from_path(self, saved_path: str):
+        try:
+            with Image.open(saved_path) as im:
+                w, h = im.size
+            self._set_last_saved_size((w, h))
+        except Exception:
+            pass
+
+    def _apply_last_saved_size(self):
+        if self._last_saved_size is None:
+            return
+        if not getattr(self, "image", None):
+            return
+
+        try:
+            if self.crop_size_label.is_editing():
+                self.crop_size_label.suppress_next_outside_commit()
+                self.crop_size_label.cancel_edit()
+        except Exception:
+            pass
+
+        w, h = self._last_saved_size
+
+        try:
+            if (
+                getattr(self.label, "fixed_crop_mode", False)
+                and getattr(self.label, "fixed_crop_size", None) == (w, h)
+            ):
+                return
+        except Exception:
+            pass
+
+        self._on_crop_size_inline_confirmed(w, h)
+        self.last_saved_size_label.flash_applied()
+
+    def _on_last_saved_size_clicked(self):
+        self._apply_last_saved_size()
 
     def pan_image(self, dx, dy):
         # ラベルのオフセット値を変更
