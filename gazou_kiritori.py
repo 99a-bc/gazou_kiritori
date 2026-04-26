@@ -52,7 +52,7 @@ except Exception:
     py7zr = None
 
 APP_NAME = "画像切り取りツール"
-APP_VERSION = "1.2.6" 
+APP_VERSION = "1.2.7" 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
@@ -98,7 +98,7 @@ def _dbg_time(label, start=None):
 # ----------------------------------------
 # ログ出力制御
 # ----------------------------------------
-LOG_ENABLED = False # デフォルトではログ出さない
+LOG_ENABLED = False  # 通常版ではログを出さない
 
 def log_debug(*args, **kwargs):
     """
@@ -982,6 +982,128 @@ class CustomListView(QtWidgets.QListView):
         # その他は通常処理
         super().keyPressEvent(event)
 
+class ToggleSwitch(QtWidgets.QAbstractButton):
+    """
+    丸いツマミが左右に動くトグルスイッチ。
+    QAbstractButton ベースなので
+    - setChecked(...)
+    - isChecked()
+    - toggled
+    がそのまま使える。
+    """
+
+    def __init__(self, parent=None, *, width=54, height=30):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self.setFixedSize(width, height)
+
+        self._margin = 2
+        self._offset = float(self._margin)
+
+        self._anim = QtCore.QPropertyAnimation(self, b"offset", self)
+        self._anim.setDuration(140)
+        self._anim.setEasingCurve(QtCore.QEasingCurve.Type.InOutCubic)
+
+        self.toggled.connect(self._start_toggle_anim)
+
+    def sizeHint(self):
+        return QtCore.QSize(self.width(), self.height())
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
+
+    def hitButton(self, pos: QtCore.QPoint) -> bool:
+        return self.rect().contains(pos)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._anim.state() != QtCore.QAbstractAnimation.State.Running:
+            self._offset = self._end_offset()
+            self.update()
+
+    def _track_rect(self) -> QtCore.QRectF:
+        r = QtCore.QRectF(self.rect())
+        return r.adjusted(1, 1, -1, -1)
+
+    def _knob_diameter(self) -> float:
+        return max(10.0, float(self.height() - self._margin * 2))
+
+    def _end_offset(self) -> float:
+        d = self._knob_diameter()
+        if self.isChecked():
+            return float(self.width() - self._margin - d)
+        return float(self._margin)
+
+    def _start_toggle_anim(self, checked: bool):
+        self._anim.stop()
+        self._anim.setStartValue(float(self._offset))
+        self._anim.setEndValue(float(self._end_offset()))
+        self._anim.start()
+
+    @QtCore.pyqtProperty(float)
+    def offset(self):
+        return float(self._offset)
+
+    @offset.setter
+    def offset(self, value):
+        self._offset = float(value)
+        self.update()
+
+    def paintEvent(self, event):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+
+        track = self._track_rect()
+        radius = track.height() / 2.0
+
+        enabled = self.isEnabled()
+        checked = self.isChecked()
+        hover = self.underMouse()
+
+        # --- 色 ---
+        if enabled:
+            if checked:
+                bg = QtGui.QColor("#4f8cff") if hover else QtGui.QColor("#3f7df0")
+                border = QtGui.QColor("#8fb6ff")
+            else:
+                bg = QtGui.QColor("#4a4a4a") if hover else QtGui.QColor("#3a3a3a")
+                border = QtGui.QColor("#808080")
+            knob = QtGui.QColor("#ffffff")
+            knob_border = QtGui.QColor(0, 0, 0, 35)
+            shadow = QtGui.QColor(0, 0, 0, 45)
+        else:
+            bg = QtGui.QColor("#2f2f2f")
+            border = QtGui.QColor("#555555")
+            knob = QtGui.QColor("#bdbdbd")
+            knob_border = QtGui.QColor(0, 0, 0, 20)
+            shadow = QtGui.QColor(0, 0, 0, 20)
+
+        # --- トラック ---
+        p.setPen(QtGui.QPen(border, 1.2))
+        p.setBrush(bg)
+        p.drawRoundedRect(track, radius, radius)
+
+        # --- ツマミ ---
+        d = self._knob_diameter()
+        knob_rect = QtCore.QRectF(self._offset, float(self._margin), d, d)
+
+        # 影
+        shadow_rect = knob_rect.adjusted(0, 1, 0, 1)
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.setBrush(shadow)
+        p.drawEllipse(shadow_rect)
+
+        # 本体
+        p.setPen(QtGui.QPen(knob_border, 1))
+        p.setBrush(knob)
+        p.drawEllipse(knob_rect)
+
 # --- ズーム倍率表示ラベル ---
 class ZoomLabel(QtWidgets.QLabel):
     def __init__(self, parent):
@@ -1042,6 +1164,75 @@ class ZoomLabel(QtWidgets.QLabel):
         self.opacity_anim.setStartValue(start)
         self.opacity_anim.setEndValue(0.0)
         self.opacity_anim.setDuration(700)
+        self.opacity_anim.start()
+
+    def clear_zoom(self):
+        self._fade_timer.stop()
+        self.opacity_anim.stop()
+        self._opacity_effect.setOpacity(1.0)
+        self.hide()
+
+
+class TransientOverlayLabel(QtWidgets.QLabel):
+    def __init__(self, parent, *, y=44):
+        super().__init__(parent)
+        self._base_y = int(y)
+        self.setObjectName("TransientOverlayLabel")
+        self.setStyleSheet("""
+            QLabel#TransientOverlayLabel {
+                color: white;
+                background-color: rgba(20, 20, 20, 180);
+                border-radius: 10px;
+                padding: 4px 14px;
+                font-weight: bold;
+                font-size: 15px;
+            }
+        """)
+        self.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignLeft
+            | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.hide()
+
+        self._opacity_effect = QtWidgets.QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._opacity_effect)
+        self._opacity_effect.setOpacity(1.0)
+
+        self.opacity_anim = QtCore.QPropertyAnimation(self._opacity_effect, b"opacity", self)
+        self.opacity_anim.setDuration(700)
+        self.opacity_anim.setStartValue(1.0)
+        self.opacity_anim.setEndValue(0.0)
+
+        self._fade_timer = QtCore.QTimer(self)
+        self._fade_timer.setSingleShot(True)
+        self._fade_timer.timeout.connect(self._start_fade)
+        self.opacity_anim.finished.connect(self.hide)
+
+    def flash_message(self, text: str, *, hold_ms: int = 2000):
+        log_debug(f"[clip_notice] FLASH text={text!r} hold_ms={hold_ms}")
+        self.setText(str(text))
+        self.adjustSize()
+        self.move(12, self._base_y)
+        self.raise_()
+        self.opacity_anim.stop()
+        self._opacity_effect.setOpacity(1.0)
+        self.show()
+        self._fade_timer.start(max(1, int(hold_ms)))
+
+    def clear_message(self):
+        log_debug(f"[clip_notice] CLEAR text={self.text()!r}")
+        self._fade_timer.stop()
+        self.opacity_anim.stop()
+        self._opacity_effect.setOpacity(1.0)
+        self.hide()
+
+    def _start_fade(self):
+        log_debug(f"[clip_notice] FADE_START text={self.text()!r}")
+        start = float(self._opacity_effect.opacity())
+        self.opacity_anim.stop()
+        self.opacity_anim.setStartValue(start)
+        self.opacity_anim.setEndValue(0.0)
         self.opacity_anim.start()
 
 class DualRotateButton(QtWidgets.QWidget):
@@ -1400,6 +1591,7 @@ class LastSavedSizeLabel(QtWidgets.QLabel):
         self._flash_timer.timeout.connect(self._clear_flash)
 
         self._apply_style()
+        _install_softtip(self)
 
     def _clear_flash(self):
         self._flash = False
@@ -1470,16 +1662,28 @@ class _CropSizeLineEdit(QtWidgets.QLineEdit):
 
     def keyPressEvent(self, event):
         key = event.key()
+
         if key in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter):
             self.enterPressed.emit()
             event.accept()
             return
+
         if key == QtCore.Qt.Key.Key_Escape:
+            # まず親の InlineCropSizeWidget に「次の外側commitを抑止」させる
+            p = self.parentWidget()
+            while p is not None:
+                if hasattr(p, "_request_cancel_edit"):
+                    p._request_cancel_edit()
+                    event.accept()
+                    return
+                p = p.parentWidget()
+
+            # 念のためのフォールバック
             self.escapePressed.emit()
             event.accept()
             return
-        super().keyPressEvent(event)
 
+        super().keyPressEvent(event)
 
 class InlineCropSizeWidget(QtWidgets.QFrame):
     sizeConfirmed = QtCore.pyqtSignal(int, int)
@@ -1496,6 +1700,8 @@ class InlineCropSizeWidget(QtWidgets.QFrame):
         self._edit_enabled = True
         self._suppress_next_outside_commit = False
 
+        self._cancelled_by_escape = False
+
         self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
 
         self._stack = QtWidgets.QStackedLayout(self)
@@ -1505,6 +1711,7 @@ class InlineCropSizeWidget(QtWidgets.QFrame):
         # --- 表示モード ---
         self.display_label = _CropSizeDisplayLabel("0 x 0", self)
         self.display_label.setToolTip("クリックで幅・高さを編集（固定サイズに切替）")
+        _install_softtip(self.display_label)
         self._stack.addWidget(self.display_label)
 
         f = self.display_label.font()
@@ -1685,12 +1892,32 @@ class InlineCropSizeWidget(QtWidgets.QFrame):
             self.width_edit.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
             self.width_edit.selectAll()
 
-    def cancel_edit(self):
+    def _request_cancel_edit(self):
         if not self._editing:
             return
+
+        # 次の focusChanged による auto-commit を止める
+        self._suppress_next_outside_commit = True
+
+        # cancel_edit をイベントループの次周回で実行
+        QtCore.QTimer.singleShot(0, self.cancel_edit)
+
+    def cancel_edit(self):
+        log_debug(f"[crop-edit] cancel_edit editing={self._editing!r}")
+        if not self._editing:
+            return
+
+        # ★ Escキャンセル後に focusChanged / 外クリック由来の commit が走らないようにする
+        self._suppress_next_outside_commit = True
+
+        self._cancelled_by_escape = True
         self._editing = False
         self._finish_edit_ui()
+
+        log_debug("[crop-edit] cancel_edit emit editCancelled")
         self.editCancelled.emit()
+
+        log_debug("[crop-edit] cancel_edit emit editFinished")
         self.editFinished.emit()
 
     def _parse_valid_size(self):
@@ -1722,21 +1949,29 @@ class InlineCropSizeWidget(QtWidgets.QFrame):
         return (w, h)
 
     def commit_edit(self):
+        log_debug(f"[crop-edit] commit_edit editing={self._editing!r}")
         if not self._editing:
             return
 
+        self._cancelled_by_escape = False
+
         parsed = self._parse_valid_size()
+        log_debug(f"[crop-edit] commit_edit parsed={parsed!r}")
         self._editing = False
         self._finish_edit_ui()
 
         if parsed is None:
+            log_debug("[crop-edit] commit_edit emit editCancelled")
             self.editCancelled.emit()
+            log_debug("[crop-edit] commit_edit emit editFinished")
             self.editFinished.emit()
             return
 
         w, h = parsed
         self.set_display_size(w, h)
+        log_debug(f"[crop-edit] commit_edit emit sizeConfirmed w={w} h={h}")
         self.sizeConfirmed.emit(w, h)
+        log_debug("[crop-edit] commit_edit emit editFinished")
         self.editFinished.emit()
 
     def _on_display_label_clicked_side(self, side: str):
@@ -1762,6 +1997,16 @@ class InlineCropSizeWidget(QtWidgets.QFrame):
     def eventFilter(self, obj, event):
         if not self._editing:
             return super().eventFilter(obj, event)
+
+        # ★ Esc は常に「キャンセル」にする
+        if event.type() == QtCore.QEvent.Type.KeyPress:
+            try:
+                if event.key() == QtCore.Qt.Key.Key_Escape:
+                    self._request_cancel_edit()
+                    event.accept()
+                    return True
+            except Exception:
+                pass
 
         if event.type() == QtCore.QEvent.Type.MouseButtonPress:
             try:
@@ -1917,6 +2162,8 @@ class ColorChipButton(QtWidgets.QToolButton):
         self._selected = False       # ★ 選択中フラグ
 
         self.setToolTip(tooltip)
+        _install_softtip(self)
+
         self.setAutoRaise(True)
         self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.setFixedSize(w, h)
@@ -2137,73 +2384,11 @@ class ActionPanel(QtWidgets.QWidget):
         self.show()
 
         # ===== ツールチップ（自作）セットアップ =====
-        self._softtip = _TipPopup(None)
-
         def _adjust_tip_text():
             return "矩形を微調整 (A)" if self.btn_adjust.isEnabled() else "32/64pxモードでは微調整は無効です"
 
-        class _TipFilter(QtCore.QObject):
-            def __init__(self, softtip, text_fn, parent=None):
-                super().__init__(parent)
-                self._softtip = softtip
-                self._text_fn = text_fn
-                self._active = False  # このウィジェット上で表示中か
-
-            # どんなイベントでもグローバル座標を安全に取る
-            def _event_global_pos(self, obj, ev) -> QtCore.QPoint:
-                # QHelpEvent (ToolTip)
-                if hasattr(ev, "globalPos"):
-                    try:
-                        return ev.globalPos()
-                    except Exception:
-                        pass
-                # QMouseEvent (MouseMove など)
-                if hasattr(ev, "globalPosition"):
-                    gp = ev.globalPosition()  # QPointF
-                    return QtCore.QPoint(int(gp.x()), int(gp.y()))
-                if hasattr(ev, "position"):
-                    # QHoverEvent / QMouseEvent でも position() はある
-                    p = ev.position()
-                    try:
-                        p = p.toPoint()  # QPointF → QPoint
-                    except Exception:
-                        p = QtCore.QPoint(int(p.x()), int(p.y()))
-                    return obj.mapToGlobal(p)
-                # 最後の保険
-                return QtGui.QCursor.pos()
-
-            def eventFilter(self, obj, ev):
-                t = ev.type()
-                if t == QtCore.QEvent.Type.ToolTip:
-                    # 1回だけ表示し、以降は無視（点滅防止）
-                    if not self._active:
-                        text = self._text_fn() if callable(self._text_fn) else ""
-                        if text:
-                            gpos = self._event_global_pos(obj, ev)
-                            self._softtip.show_text(text, gpos)
-                            self._active = True
-                    return True  # ネイティブ抑止
-
-                elif t in (QtCore.QEvent.Type.Leave,
-                        QtCore.QEvent.Type.Hide,
-                        QtCore.QEvent.Type.WindowDeactivate):
-                    self._softtip.hide()
-                    self._active = False
-                    return False
-
-                elif t == QtCore.QEvent.Type.MouseMove:
-                    # 位置だけ追従（文面は固定）
-                    if self._active:
-                        gpos = self._event_global_pos(obj, ev)
-                        self._softtip.show_text(self._text_fn(), gpos)
-                    return False
-
-                return False
-
-        # 取り付け（ネイティブtoolTipは空にして抑止）
-        self._adj_filter = _TipFilter(self._softtip, _adjust_tip_text, self.btn_adjust)
-        self.btn_adjust.installEventFilter(self._adj_filter)
-        self.btn_adjust.setToolTip("")
+        self.btn_adjust.setToolTip("")  # 標準 QToolTip は出さない
+        self._adj_filter = _install_softtip(self.btn_adjust, text_getter=_adjust_tip_text)
 
     def set_adjusting(self, on: bool) -> None:
         """調整モードのON/OFFに応じてボタンラベルを切り替える。"""
@@ -2479,6 +2664,7 @@ class NudgePanel(QtWidgets.QFrame):
         self._btn_ratio.setText("比率固定")
         self._btn_ratio.setCheckable(True)
         self._btn_ratio.setToolTip("矩形のリサイズを比率固定にします（四隅ハンドルのみ有効）")
+        _install_softtip(self._btn_ratio)
         self._btn_ratio.toggled.connect(self._on_ratio_toggled)
 
         vb.addWidget(self._btn_ratio, alignment=QtCore.Qt.AlignmentFlag.AlignLeft)
@@ -3020,6 +3206,21 @@ class CropLabel(QtWidgets.QLabel):
         vr = getattr(self, "_view_rect_scaled", QtCore.QRect(0, 0, pm_w, pm_h))
         self._view_rect_scaled = vr.intersected(QtCore.QRect(0, 0, pm_w, pm_h))
 
+        try:
+            log_debug(
+                "[geom] _recalc_pixmap_offsets "
+                f"label=({lw}x{lh}) "
+                f"pixmap=({pw}x{ph}) "
+                f"init=({self._init_offset_x},{self._init_offset_y}) "
+                f"zoom={zoom} "
+                f"base=({base_w}x{base_h}) "
+                f"pm=({pm_w}x{pm_h}) "
+                f"vr=({self._view_rect_scaled.x()},{self._view_rect_scaled.y()},"
+                f"{self._view_rect_scaled.width()},{self._view_rect_scaled.height()})"
+            )
+        except Exception:
+            pass
+
     def _sync_fixed_size_from_rect(self) -> None:
         """fixed_crop_rect_img の現在サイズを fixed_crop_size に反映する"""
         try:
@@ -3454,7 +3655,12 @@ class CropLabel(QtWidgets.QLabel):
             w, h = r.width(), r.height()
             nx, ny = ix - dx, iy - dy
 
-            new_rect = QtCore.QRect(nx, ny, w, h)  # クランプなし
+            new_rect = QtCore.QRect(nx, ny, w, h)
+            clipped = False
+            if self._constrain_enabled():
+                new_rect, clipped = self._adjust_existing_rect_into_image(new_rect)
+                if clipped and hasattr(self.mainwin, "show_crop_clip_notice"):
+                    self.mainwin.show_crop_clip_notice()
 
             self.fixed_crop_rect_img = QtCore.QRect(new_rect)
             try:
@@ -3532,10 +3738,31 @@ class CropLabel(QtWidgets.QLabel):
                 ndx, ndy = (cand1_dx, cand1_dy) if d1 <= d2 else (cand2_dx, cand2_dy)
 
                 x2, y2 = int(round(ax + ndx)), int(round(ay + ndy))
-                new_rect = QtCore.QRect(QtCore.QPoint(min(ax, x2), min(ay, y2)),
-                                        QtCore.QPoint(max(ax, x2), max(ay, y2)))
-                if new_rect.width()  < 1: new_rect.setWidth(1)
-                if new_rect.height() < 1: new_rect.setHeight(1)
+
+                clamp_handle = self._effective_resize_handle_from_cross(
+                    self._resize_start_rect_img,
+                    self._resize_handle or "",
+                    x2,
+                    y2,
+                )
+
+                new_rect = QtCore.QRect(
+                    QtCore.QPoint(min(ax, x2), min(ay, y2)),
+                    QtCore.QPoint(max(ax, x2), max(ay, y2))
+                )
+                if new_rect.width() < 1:
+                    new_rect.setWidth(1)
+                if new_rect.height() < 1:
+                    new_rect.setHeight(1)
+
+                if self._constrain_enabled():
+                    new_rect = self._clamp_aspect_resize_rect(
+                        QtCore.QPoint(ax, ay),
+                        x2,
+                        y2,
+                        clamp_handle,
+                        ratio,
+                    )
 
                 if self.fixed_crop_mode and self.fixed_crop_rect_img is not None:
                     self.fixed_crop_rect_img = new_rect
@@ -3557,15 +3784,34 @@ class CropLabel(QtWidgets.QLabel):
         if getattr(self, "adjust_mode", False) and getattr(self, "_resize_handle", None):
             gx, gy = self.label_to_image_coords(pt.x(), pt.y())
             r0 = QtCore.QRect(self._resize_start_rect_img)
+
             left, right = r0.left(), r0.right()
             top, bottom = r0.top(), r0.bottom()
+
             h = self._resize_handle
-            if "l" in h: left   = gx
-            if "r" in h: right  = gx
-            if "t" in h: top    = gy
-            if "b" in h: bottom = gy
-            new_rect = QtCore.QRect(QtCore.QPoint(min(left, right),  min(top, bottom)),
-                                    QtCore.QPoint(max(left, right),  max(top, bottom)))
+            if "l" in h:
+                left = gx
+            if "r" in h:
+                right = gx
+            if "t" in h:
+                top = gy
+            if "b" in h:
+                bottom = gy
+
+            clamp_handle = self._effective_resize_handle_from_cross(
+                self._resize_start_rect_img,
+                self._resize_handle or "",
+                gx,
+                gy,
+            )
+
+            new_rect = QtCore.QRect(
+                QtCore.QPoint(min(left, right), min(top, bottom)),
+                QtCore.QPoint(max(left, right), max(top, bottom))
+            )
+
+            if self._constrain_enabled():
+                new_rect = self._clamp_edge_resize_rect(new_rect, clamp_handle)
             if self.fixed_crop_mode and self.fixed_crop_rect_img is not None:
                 self.fixed_crop_rect_img = new_rect
                 x1, y1 = self.image_to_label_coords(new_rect.left(),  new_rect.top())
@@ -3617,7 +3863,13 @@ class CropLabel(QtWidgets.QLabel):
                 new_topleft = pt - self.fixed_crop_drag_offset
                 img_left, img_top = self.label_to_image_coords(new_topleft.x(), new_topleft.y())
                 crop_w, crop_h = self.fixed_crop_size
-                self.fixed_crop_rect_img = QtCore.QRect(img_left, img_top, crop_w, crop_h)
+                new_rect = QtCore.QRect(img_left, img_top, crop_w, crop_h)
+                clipped = False
+                if self._constrain_enabled():
+                    new_rect, clipped = self._adjust_existing_rect_into_image(new_rect)
+                    if clipped and hasattr(self.mainwin, "show_crop_clip_notice"):
+                        self.mainwin.show_crop_clip_notice()
+                self.fixed_crop_rect_img = QtCore.QRect(new_rect)
                 self.update()
                 x1, y1 = self.image_to_label_coords(self.fixed_crop_rect_img.left(),  self.fixed_crop_rect_img.top())
                 x2, y2 = self.image_to_label_coords(self.fixed_crop_rect_img.right(), self.fixed_crop_rect_img.bottom())
@@ -3642,17 +3894,29 @@ class CropLabel(QtWidgets.QLabel):
                     mh = getattr(self.mainwin, "multiple_h", 64)
                     self.drag_rect_img = self._apply_multiple_and_keep_inside(x1, y1, img_x, img_y, mw, mh)
                 else:
-                    left   = min(x1, img_x)
-                    top    = min(y1, img_y)
-                    right  = max(x1, img_x)
-                    bottom = max(y1, img_y)
-                    self.drag_rect_img = QtCore.QRect(left, top, right - left, bottom - top)
+                    if self._constrain_enabled():
+                        self.drag_rect_img = self._build_constrained_drag_rect(x1, y1, img_x, img_y)
+                    else:
+                        left   = min(x1, img_x)
+                        top    = min(y1, img_y)
+                        right  = max(x1, img_x)
+                        bottom = max(y1, img_y)
+                        self.drag_rect_img = QtCore.QRect(left, top, right - left, bottom - top)
 
                 self.update()
-                x1, y1 = self.image_to_label_coords(self.drag_rect_img.left(),  self.drag_rect_img.top())
-                x2, y2 = self.image_to_label_coords(self.drag_rect_img.right(), self.drag_rect_img.bottom())
-                rect = QtCore.QRect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
-                self.movedRect.emit(rect)
+                if self.drag_rect_img is not None and self.drag_rect_img.width() > 0 and self.drag_rect_img.height() > 0:
+                    x1, y1 = self.image_to_label_coords(self.drag_rect_img.left(),  self.drag_rect_img.top())
+                    x2, y2 = self.image_to_label_coords(self.drag_rect_img.right(), self.drag_rect_img.bottom())
+                    rect = QtCore.QRect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+                    self.movedRect.emit(rect)
+                else:
+                    try:
+                        self.mainwin._crop_rect = None
+                        self.mainwin._crop_rect_img = None
+                    except Exception:
+                        pass
+                    if hasattr(self.mainwin, "update_crop_size_label"):
+                        self.mainwin.update_crop_size_label(None)
 
         #  固定モードのホバーでカーソル更新 ===
         try:
@@ -4112,12 +4376,19 @@ class CropLabel(QtWidgets.QLabel):
         img_w = int(self.mainwin.image.width)
         img_h = int(self.mainwin.image.height)
 
+        log_debug(f"[coord] image_to_label in=({gx},{gy})")
+
         init_x, init_y, pm_w, pm_h, vr = self._current_geometry()
         px = float(gx) * (pm_w / float(img_w))
         py = float(gy) * (pm_h / float(img_h))
 
         lx = int(round((px - vr.x()) + init_x))
         ly = int(round((py - vr.y()) + init_y))
+        log_debug(
+            f"[coord] image_to_label out=({lx},{ly}) "
+            f"pm=({pm_w}x{pm_h}) init=({init_x},{init_y}) "
+            f"vr=({vr.x()},{vr.y()},{vr.width()},{vr.height()})"
+        )
         return lx, ly
 
     def _current_geometry(self):
@@ -4145,7 +4416,271 @@ class CropLabel(QtWidgets.QLabel):
 
         vr = getattr(self, "_view_rect_scaled", QtCore.QRect(0, 0, pm_w, pm_h))
         vr = vr.intersected(QtCore.QRect(0, 0, pm_w, pm_h))
+
+        log_debug(
+            "[geom] _current_geometry "
+            f"label=({self.width()}x{self.height()}) "
+            f"pixmap=({pw}x{ph}) "
+            f"init=({init_x},{init_y}) "
+            f"zoom={zoom} "
+            f"base=({base_w}x{base_h}) "
+            f"pm=({pm_w}x{pm_h}) "
+            f"vr=({vr.x()},{vr.y()},{vr.width()},{vr.height()})"
+        )
         return init_x, init_y, pm_w, pm_h, vr
+
+    def _crop_image_bounds(self) -> QtCore.QRect | None:
+        img = getattr(self.mainwin, "image", None)
+        if img is None:
+            return None
+        try:
+            w = int(img.width)
+            h = int(img.height)
+        except Exception:
+            try:
+                w = int(img.size[0])
+                h = int(img.size[1])
+            except Exception:
+                return None
+        if w <= 0 or h <= 0:
+            return None
+        return QtCore.QRect(0, 0, w, h)
+
+    def _constrain_enabled(self) -> bool:
+        return bool(getattr(self.mainwin, "constrain_crop_to_image", False))
+
+    def _clamp_point_to_image(self, x: int, y: int) -> tuple[int, int]:
+        bounds = self._crop_image_bounds()
+        if bounds is None:
+            return int(x), int(y)
+        max_x = bounds.x() + bounds.width()
+        max_y = bounds.y() + bounds.height()
+        x = max(bounds.left(), min(int(x), max_x))
+        y = max(bounds.top(),  min(int(y), max_y))
+        return x, y
+
+    def _build_constrained_drag_rect(self, x1: int, y1: int, x2: int, y2: int) -> QtCore.QRect | None:
+        ax, ay = self._clamp_point_to_image(x1, y1)
+        bx, by = self._clamp_point_to_image(x2, y2)
+        left = min(ax, bx)
+        top = min(ay, by)
+        right = max(ax, bx)
+        bottom = max(ay, by)
+        if right <= left or bottom <= top:
+            return None
+        return QtCore.QRect(int(left), int(top), int(right - left), int(bottom - top))
+
+    def _adjust_existing_rect_into_image(self, rect: QtCore.QRect | None) -> tuple[QtCore.QRect | None, bool]:
+        if rect is None:
+            return None, False
+        bounds = self._crop_image_bounds()
+        if bounds is None:
+            return QtCore.QRect(rect), False
+
+        r = QtCore.QRect(rect)
+        if r.isNull():
+            return QtCore.QRect(r), False
+
+        left = int(r.left())
+        top = int(r.top())
+        right = int(r.right())
+        bottom = int(r.bottom())
+
+        # まずサイズ維持でスライド吸収
+        if left < bounds.left():
+            shift = bounds.left() - left
+            left += shift
+            right += shift
+        if right > bounds.right():
+            shift = right - bounds.right()
+            left -= shift
+            right -= shift
+        if top < bounds.top():
+            shift = bounds.top() - top
+            top += shift
+            bottom += shift
+        if bottom > bounds.bottom():
+            shift = bottom - bounds.bottom()
+            top -= shift
+            bottom -= shift
+
+        # それでも入らない分だけ最後にクリップ
+        clipped = False
+        new_left = max(left, bounds.left())
+        new_top = max(top, bounds.top())
+        new_right = min(right, bounds.right())
+        new_bottom = min(bottom, bounds.bottom())
+        if (new_left, new_top, new_right, new_bottom) != (left, top, right, bottom):
+            clipped = True
+
+        if new_right < new_left:
+            new_right = new_left
+        if new_bottom < new_top:
+            new_bottom = new_top
+
+        nr = QtCore.QRect(QtCore.QPoint(int(new_left), int(new_top)), QtCore.QPoint(int(new_right), int(new_bottom)))
+        return nr, clipped
+
+    def _effective_resize_handle_from_cross(
+        self,
+        start_rect: QtCore.QRect | None,
+        handle: str,
+        gx: int,
+        gy: int,
+    ) -> str:
+        """
+        ドラッグ中に辺/頂点が反対側へ入れ替わった場合、
+        その時点で“実際に動いている側”のハンドル名へ変換する。
+        例:
+            l  -> r
+            tl -> tr / bl / br
+        """
+        h = str(handle or "")
+        if not h or start_rect is None:
+            return h
+
+        r0 = QtCore.QRect(start_rect)
+
+        flip_x = False
+        flip_y = False
+
+        if "l" in h:
+            flip_x = gx > r0.right()
+        elif "r" in h:
+            flip_x = gx < r0.left()
+
+        if "t" in h:
+            flip_y = gy > r0.bottom()
+        elif "b" in h:
+            flip_y = gy < r0.top()
+
+        if flip_x:
+            h = h.replace("l", "L").replace("r", "l").replace("L", "r")
+        if flip_y:
+            h = h.replace("t", "T").replace("b", "t").replace("T", "b")
+
+        return h
+
+    def _clamp_edge_resize_rect(self, rect: QtCore.QRect, handle: str) -> QtCore.QRect:
+        bounds = self._crop_image_bounds()
+        if bounds is None:
+            return QtCore.QRect(rect)
+
+        r = QtCore.QRect(rect)
+        left, top, right, bottom = r.left(), r.top(), r.right(), r.bottom()
+        if "l" in handle:
+            left = max(bounds.left(), left)
+            left = min(left, right - 1)
+        if "r" in handle:
+            right = min(bounds.right(), right)
+            right = max(right, left + 1)
+        if "t" in handle:
+            top = max(bounds.top(), top)
+            top = min(top, bottom - 1)
+        if "b" in handle:
+            bottom = min(bounds.bottom(), bottom)
+            bottom = max(bottom, top + 1)
+        return QtCore.QRect(QtCore.QPoint(int(left), int(top)), QtCore.QPoint(int(right), int(bottom)))
+
+    def _clamp_aspect_resize_rect(
+        self,
+        anchor: QtCore.QPoint,
+        x2: int,
+        y2: int,
+        handle: str,
+        ratio: float,
+    ) -> QtCore.QRect:
+        bounds = self._crop_image_bounds()
+        if bounds is None or ratio is None or ratio <= 0:
+            return QtCore.QRect(
+                QtCore.QPoint(min(anchor.x(), x2), min(anchor.y(), y2)),
+                QtCore.QPoint(max(anchor.x(), x2), max(anchor.y(), y2)),
+            )
+
+        ax, ay = int(anchor.x()), int(anchor.y())
+        h = str(handle or "")
+
+        sx = -1 if "l" in h else 1
+        sy = -1 if "t" in h else 1
+
+        req_dx = abs(int(x2) - ax)
+        req_dy = abs(int(y2) - ay)
+
+        if req_dx == 0 and req_dy == 0:
+            return QtCore.QRect(QtCore.QPoint(ax, ay), QtCore.QPoint(ax, ay))
+
+        max_dx = (ax - bounds.left()) if sx < 0 else (bounds.right() - ax)
+        max_dy = (ay - bounds.top()) if sy < 0 else (bounds.bottom() - ay)
+
+        max_dx = max(0, int(max_dx))
+        max_dy = max(0, int(max_dy))
+
+        if max_dx == 0 or max_dy == 0:
+            return QtCore.QRect(QtCore.QPoint(ax, ay), QtCore.QPoint(ax, ay))
+
+        # 端のごく近くでは毎回の丸め誤差で 1px 振れやすいので、
+        # その領域に入ったら「最大で入る比率固定矩形」にスナップして安定化する
+        edge_snap_px = 1
+
+        if req_dx < (max_dx - edge_snap_px) and req_dy < (max_dy - edge_snap_px):
+            nx = ax + sx * req_dx
+            ny = ay + sy * req_dy
+            return QtCore.QRect(
+                QtCore.QPoint(min(ax, nx), min(ay, ny)),
+                QtCore.QPoint(max(ax, nx), max(ay, ny)),
+            )
+
+        def _fit_from_dx(dx_base: int) -> tuple[int, int]:
+            dx = max(1, min(max_dx, int(dx_base)))
+            dy = max(1, int(round(dx / float(ratio))))
+            if dy > max_dy:
+                dy = max_dy
+                dx = max(1, int(round(dy * float(ratio))))
+            dx = min(dx, max_dx)
+            dy = min(dy, max_dy)
+            return dx, dy
+
+        def _fit_from_dy(dy_base: int) -> tuple[int, int]:
+            dy = max(1, min(max_dy, int(dy_base)))
+            dx = max(1, int(round(dy * float(ratio))))
+            if dx > max_dx:
+                dx = max_dx
+                dy = max(1, int(round(dx / float(ratio))))
+            dx = min(dx, max_dx)
+            dy = min(dy, max_dy)
+            return dx, dy
+
+        cand_x = _fit_from_dx(max_dx)
+        cand_y = _fit_from_dy(max_dy)
+
+        area_x = cand_x[0] * cand_x[1]
+        area_y = cand_y[0] * cand_y[1]
+
+        if area_x > area_y:
+            dx, dy = cand_x
+        elif area_y > area_x:
+            dx, dy = cand_y
+        else:
+            # tie は決め打ちで固定しておく（ここが揺れるとまたブレる）
+            dx, dy = cand_x if (cand_x[0], cand_x[1]) >= (cand_y[0], cand_y[1]) else cand_y
+
+        nx = ax + sx * dx
+        ny = ay + sy * dy
+
+        left = min(ax, nx)
+        right = max(ax, nx)
+        top = min(ay, ny)
+        bottom = max(ay, ny)
+
+        left = max(bounds.left(), left)
+        right = min(bounds.right(), right)
+        top = max(bounds.top(), top)
+        bottom = min(bounds.bottom(), bottom)
+
+        return QtCore.QRect(
+            QtCore.QPoint(int(left), int(top)),
+            QtCore.QPoint(int(right), int(bottom))
+        )
 
     def label_to_image_coords(self, lx, ly):
         """QLabel座標 -> 元画像ピクセル"""
@@ -4154,12 +4689,19 @@ class CropLabel(QtWidgets.QLabel):
         img_w = int(self.mainwin.image.width)
         img_h = int(self.mainwin.image.height)
 
+        log_debug(f"[coord] label_to_image in=({lx},{ly})")
+
         init_x, init_y, pm_w, pm_h, vr = self._current_geometry()
         px = float(vr.x() + (float(lx) - init_x))
         py = float(vr.y() + (float(ly) - init_y))
 
         gx = int(round(px * (float(img_w) / pm_w)))
         gy = int(round(py * (float(img_h) / pm_h)))
+        log_debug(
+            f"[coord] label_to_image out=({gx},{gy}) "
+            f"pm=({pm_w}x{pm_h}) init=({init_x},{init_y}) "
+            f"vr=({vr.x()},{vr.y()},{vr.width()},{vr.height()})"
+        )
         return gx, gy
     
     def _imgrect_to_labelrect(self, r_img: QtCore.QRect | None) -> QtCore.QRect | None:
@@ -4268,7 +4810,17 @@ class CropLabel(QtWidgets.QLabel):
         left = (img_w - crop_w) // 2
         top  = (img_h - crop_h) // 2
         
-        self.fixed_crop_rect_img = QtCore.QRect(left, top, crop_w, crop_h)
+        new_rect = QtCore.QRect(left, top, crop_w, crop_h)
+        clipped = False
+        if self._constrain_enabled():
+            new_rect, clipped = self._adjust_existing_rect_into_image(new_rect)
+            if clipped and hasattr(self.mainwin, "show_crop_clip_notice"):
+                self.mainwin.show_crop_clip_notice()
+        self.fixed_crop_rect_img = QtCore.QRect(new_rect)
+        try:
+            self.fixed_crop_size = (int(self.fixed_crop_rect_img.width()), int(self.fixed_crop_rect_img.height()))
+        except Exception:
+            pass
 
         pm = self.pixmap()
         if not pm:
@@ -4400,6 +4952,10 @@ class CropLabel(QtWidgets.QLabel):
             elif key == QtCore.Qt.Key.Key_Up:    rect.moveTop (rect.top()  - step);  moved = True
             elif key == QtCore.Qt.Key.Key_Down:  rect.moveTop (rect.top()  + step);  moved = True
             if moved:
+                if self._constrain_enabled():
+                    rect, clipped = self._adjust_existing_rect_into_image(rect)
+                    if clipped and hasattr(self.mainwin, "show_crop_clip_notice"):
+                        self.mainwin.show_crop_clip_notice()
                 self.fixed_crop_rect_img = QtCore.QRect(rect)
                 is_fixed = True
 
@@ -4411,6 +4967,10 @@ class CropLabel(QtWidgets.QLabel):
             elif key == QtCore.Qt.Key.Key_Up:    rect.translate(0, -step); moved = True
             elif key == QtCore.Qt.Key.Key_Down:  rect.translate(0,  step); moved = True
             if moved:
+                if self._constrain_enabled():
+                    rect, clipped = self._adjust_existing_rect_into_image(rect)
+                    if clipped and hasattr(self.mainwin, "show_crop_clip_notice"):
+                        self.mainwin.show_crop_clip_notice()
                 self.drag_rect_img = QtCore.QRect(rect)
                 is_fixed = False
 
@@ -5501,6 +6061,10 @@ class CropperApp(QtWidgets.QMainWindow):
         # ★ ループ状態を設定から復元（なければ False）
         self._thumb_loop_enabled = bool(self.settings.value("thumb_loop_enabled", False, type=bool))
 
+        # 矩形を画像内に制限（設定から復元。なければ OFF）
+        self.constrain_crop_to_image = bool(
+            self.settings.value("constrain_crop_to_image", False, type=bool)
+        )
 
         self.alpha_output_format = self.settings.value("alpha_output_format", "png", type=str).lower()
         if self.alpha_output_format not in ("png", "webp"):
@@ -5552,6 +6116,10 @@ class CropperApp(QtWidgets.QMainWindow):
 
         self.shortcut_delete = QShortcut(QKeySequence(QtCore.Qt.Key.Key_Delete), self)
         self.shortcut_delete.activated.connect(self.delete_current_image)
+
+        self.shortcut_constrain_crop = QShortcut(QKeySequence("Shift+C"), self)
+        self.shortcut_constrain_crop.setContext(QtCore.Qt.ShortcutContext.WindowShortcut)
+        self.shortcut_constrain_crop.activated.connect(self._toggle_constrain_crop_shortcut)
 
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.resize(1000, 700)
@@ -6072,15 +6640,55 @@ class CropperApp(QtWidgets.QMainWindow):
 
         QtCore.QTimer.singleShot(0, self._reposition_checker_bg_button)
 
-        # 「色チップ列」＋「保存方法」＋「保存先」を横並びで包む
+        # 「色チップ列」＋「保存方法/保存先」＋「画像外禁止」を横並びで包む
         row_widget = QtWidgets.QWidget()
         wrap = QtWidgets.QHBoxLayout(row_widget)
         wrap.setContentsMargins(0, 13, 0, 0)
-        wrap.setSpacing(16)
+        wrap.setSpacing(0)
+
         wrap.addWidget(left)
         wrap.addStretch(1)
-        wrap.addWidget(grp_mode,  0, QtCore.Qt.AlignmentFlag.AlignVCenter)
-        wrap.addWidget(grp_dest,  0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+        # --- 保存方法 + 保存先 をひとまとめ ---
+        save_groups_wrap = QtWidgets.QWidget()
+        save_groups_lay = QtWidgets.QHBoxLayout(save_groups_wrap)
+        save_groups_lay.setContentsMargins(0, 0, 0, 0)
+        save_groups_lay.setSpacing(5)
+        save_groups_lay.addSpacing(10)
+        save_groups_lay.addWidget(grp_mode, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        save_groups_lay.addWidget(grp_dest, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+        wrap.addWidget(save_groups_wrap, 0, QtCore.Qt.AlignmentFlag.AlignTop)
+
+        # --- 画像外禁止 ---
+        self.chk_constrain_crop_quick = ToggleSwitch(width=40, height=18)
+        self.chk_constrain_crop_quick.setChecked(bool(getattr(self, "constrain_crop_to_image", False)))
+        self.chk_constrain_crop_quick.setToolTip("通常矩形・固定矩形が画像内に収まるよう補正します")
+        self.chk_constrain_crop_quick.toggled.connect(self._on_constrain_crop_toggled)
+
+        constrain_wrap = QtWidgets.QWidget()
+        constrain_wrap.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+
+        constrain_lay = QtWidgets.QVBoxLayout(constrain_wrap)
+        constrain_lay.setContentsMargins(0, 0, 0, 0)
+        constrain_lay.setSpacing(2)
+
+        constrain_title = QtWidgets.QLabel("画像外禁止")
+        constrain_title.setStyleSheet("color:#ffffff; background:transparent; border:none;")
+        constrain_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter)
+        constrain_title.setToolTip("通常矩形・固定矩形が画像内に収まるよう補正します")
+
+        constrain_lay.addWidget(constrain_title, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
+        constrain_lay.addWidget(self.chk_constrain_crop_quick, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
+
+        # ★ ここで「左へ寄せる量」を調整
+        wrap.addSpacing(9)
+
+        # ★ ここで「上へ揃える」
+        wrap.addWidget(constrain_wrap, 0, QtCore.Qt.AlignmentFlag.AlignTop)
 
         # 横に広がらず、中身ぶんだけの幅で左寄せ表示にする
         row_widget.setSizePolicy(
@@ -6813,6 +7421,7 @@ class CropperApp(QtWidgets.QMainWindow):
 
         # --- ズーム倍率表示ラベルをCropLabel上に追加 ---
         self.zoom_label = ZoomLabel(self.label)
+        self.clip_notice_label = TransientOverlayLabel(self.label, y=44)
         # 念のため遅延版を外す（無ければ except に落ちるだけ）
         try:
             self.listview.clicked.disconnect(self._on_thumb_clicked_delayed)
@@ -7145,8 +7754,28 @@ class CropperApp(QtWidgets.QMainWindow):
 
         outer_layout.addWidget(self.bottom_bar, stretch=0)
 
-
         self._set_progress_visible(False)
+
+        _install_softtip_recursive(self)
+
+        # save_folder_label / path_label は従来の tooltip に任せる
+        for _lbl_name in ("save_folder_label", "path_label"):
+            try:
+                _lbl = getattr(self, _lbl_name, None)
+                if _lbl is None:
+                    continue
+
+                filt = getattr(_lbl, "_softtip_filter", None)
+                if filt is not None:
+                    _lbl.removeEventFilter(filt)
+                    _lbl._softtip_filter = None
+
+                popup = getattr(_lbl, "_softtip_popup", None)
+                if popup is not None:
+                    popup.hide()
+                    _lbl._softtip_popup = None
+            except Exception:
+                pass
 
         self._install_folder_shortcuts()
     
@@ -7512,8 +8141,14 @@ class CropperApp(QtWidgets.QMainWindow):
             folder = getattr(self, "save_folder", "") or ""
 
         if not folder or not os.path.isdir(folder):
-            lbl.setText(prefix + "—")
-            lbl.setToolTip(prefix + "未設定")
+            new_text = prefix + "—"
+            new_tip = prefix + "未設定"
+
+            # ★ 同じ内容なら再設定しない
+            if lbl.text() != new_text:
+                lbl.setText(new_text)
+            if lbl.toolTip() != new_tip:
+                lbl.setToolTip(new_tip)
             return
 
         fm = lbl.fontMetrics()
@@ -7538,12 +8173,18 @@ class CropperApp(QtWidgets.QMainWindow):
         )
 
         # プレフィックスは非リンク、パスだけリンク（style で色指定）
-        lbl.setText(
+        new_text = (
             f'{pad_html}{escape(prefix)}'
             f'<a href="{url}" style="color:{link_color}; text-decoration: underline;">'
             f'{escape(shown_plain)}</a>'
         )
-        lbl.setToolTip(f'{prefix}{folder}')
+        new_tip = f'{prefix}{folder}'
+
+        # ★ 同じ内容なら再設定しない
+        if lbl.text() != new_text:
+            lbl.setText(new_text)
+        if lbl.toolTip() != new_tip:
+            lbl.setToolTip(new_tip)
 
     def _open_save_folder_link(self, href: str):
         try:
@@ -7673,18 +8314,17 @@ class CropperApp(QtWidgets.QMainWindow):
         if obj is getattr(self, "save_folder_label", None):
             et = event.type()
 
-            # ホバー開始
+            # ホバー開始時だけ更新
             if et in (
                 QtCore.QEvent.Type.Enter,
                 QtCore.QEvent.Type.HoverEnter,
-                QtCore.QEvent.Type.HoverMove,
             ):
                 if not self._save_link_hovered:
                     self._save_link_hovered = True
                     self._update_save_elision()
                 return False
 
-            # ホバー終了
+            # ホバー終了時だけ更新
             if et in (
                 QtCore.QEvent.Type.Leave,
                 QtCore.QEvent.Type.HoverLeave,
@@ -7699,6 +8339,7 @@ class CropperApp(QtWidgets.QMainWindow):
                 self._update_save_elision()
                 return False
 
+            # HoverMove では更新しない
             return False
 
         # 2) メインプレビュー（self.label）
@@ -7849,6 +8490,7 @@ class CropperApp(QtWidgets.QMainWindow):
                         return
         event.ignore()
 
+
     def open_image_from_path(self, file_path, *, focus_in_browser: bool = False):
         if not file_path:
             return
@@ -7944,6 +8586,24 @@ class CropperApp(QtWidgets.QMainWindow):
             else:
                 rect_img = QtCore.QRect(rect_img)
 
+            clipped = False
+
+            # ★ 復元時も、現在画像サイズに対して制限モード補正を必ず通す
+            try:
+                if bool(getattr(self, "constrain_crop_to_image", False)):
+                    # 復元済み矩形は fixed / 通常ともに「既存サイズを持つ矩形」として扱う
+                    new_rect, clipped = self.label._adjust_existing_rect_into_image(rect_img)
+
+                    if new_rect is not None and not new_rect.isNull():
+                        rect_img = QtCore.QRect(new_rect)
+                    else:
+                        rect_img = QtCore.QRect()
+
+                    if clipped and hasattr(self, "show_crop_clip_notice"):
+                        QtCore.QTimer.singleShot(0, self.show_crop_clip_notice)
+            except Exception as e:
+                log_debug("[open] restore constrain error:", repr(e))
+
             # ★ 保存直後だけは、矩形表示用とプレビュー用で別矩形を使えるようにする
             preview_rect_img = None
             try:
@@ -7970,6 +8630,10 @@ class CropperApp(QtWidgets.QMainWindow):
                     self.label._sync_fixed_size_from_rect()
                 except Exception:
                     pass
+                try:
+                    self._sync_fixed_rect_base_to_current()
+                except Exception:
+                    pass
                 if hasattr(self, "show_action_panel"):
                     self.show_action_panel(r_lbl, True)
             else:
@@ -7979,12 +8643,24 @@ class CropperApp(QtWidgets.QMainWindow):
                 if hasattr(self, "show_action_panel"):
                     self.show_action_panel(r_lbl, False)
 
-            # アスペクト固定
+            # ★ 比率固定の復元に使う基準を決める
+            aspect_base = preserve_dict.get("aspect_base") if preserve_dict else None
+            if clipped:
+                aspect_base = (int(rect_img.width()), int(rect_img.height()))
+
+            # ★ アスペクト固定
             try:
                 if preserve_dict and preserve_dict.get("aspect_lock", False) and hasattr(self, "set_aspect_lock"):
-                    self.set_aspect_lock(True, preserve_dict.get("aspect_base"))
+                    self.set_aspect_lock(True, aspect_base)
             except Exception:
                 pass
+
+            # ★ clipped されたなら、内部値とパネル表示も現在矩形へ確実に揃える
+            if clipped and preserve_dict and preserve_dict.get("aspect_lock", False):
+                try:
+                    self._sync_aspect_base_to_current()
+                except Exception as e:
+                    log_debug("[open] restore sync aspect base error:", repr(e))
 
             # サイズラベル/プレビュー
             try:
@@ -8007,7 +8683,6 @@ class CropperApp(QtWidgets.QMainWindow):
             try:
                 if preserve_dict and preserve_dict.get("adjust", False) and hasattr(self, "set_adjust_mode"):
                     self.set_adjust_mode(True)
-                # ★追加：Nudge を必ず起こす（位置合わせは内部でやる）
                 if hasattr(self, "ensure_nudge_visibility"):
                     self.ensure_nudge_visibility(True)
             except Exception:
@@ -8071,13 +8746,17 @@ class CropperApp(QtWidgets.QMainWindow):
                     if getattr(self.label, "fixed_crop_rect_img", None) is not None else None
                 )
 
-                # 固定枠が有効なら base 優先で使う
+                # 固定枠が有効なら、画像外禁止ON時は「今見えている current」を優先する
                 base_fixed = getattr(self.label, "fixed_crop_rect_img_base", None)
                 cur_fixed  = getattr(self.label, "fixed_crop_rect_img", None)
 
                 if getattr(self.label, "fixed_crop_mode", False) and (base_fixed is not None or cur_fixed is not None):
                     prev_fixed = True
-                    prev_rect_img = QtCore.QRect(base_fixed or cur_fixed)
+
+                    if bool(getattr(self, "constrain_crop_to_image", False)) and cur_fixed is not None:
+                        prev_rect_img = QtCore.QRect(cur_fixed)
+                    else:
+                        prev_rect_img = QtCore.QRect(base_fixed or cur_fixed)
                 else:
                     tmp = getattr(self, "_crop_rect_img", None)
                     prev_rect_img = _safe_qrect(tmp, fmt="xywh") if tmp is not None else QtCore.QRect()
@@ -8155,10 +8834,11 @@ class CropperApp(QtWidgets.QMainWindow):
             if isinstance(preserve, dict):
                 _try_restore(preserve, fallback_rect_img=prev_rect_img, fallback_fixed=prev_fixed)
 
-                # ★ fixed を復元したら、次回ナビ用の base も復元前の矩形で戻す
+                # ★修正：base は「復元前の矩形」ではなく「復元後に実際に採用された矩形」で更新する
                 try:
-                    if prev_fixed and prev_rect_img is not None and not prev_rect_img.isNull():
-                        self.label.fixed_crop_rect_img_base = QtCore.QRect(prev_rect_img)
+                    cur_fixed = getattr(self.label, "fixed_crop_rect_img", None)
+                    if getattr(self.label, "fixed_crop_mode", False) and cur_fixed is not None and not cur_fixed.isNull():
+                        self.label.fixed_crop_rect_img_base = QtCore.QRect(cur_fixed)
                         log_debug(
                             "[open/light] restored fixed rect base =",
                             tuple(self.label.fixed_crop_rect_img_base.getRect())
@@ -8309,6 +8989,15 @@ class CropperApp(QtWidgets.QMainWindow):
                     pass
 
                 def _on_thumb_current_changed(cur: QtCore.QModelIndex, prev: QtCore.QModelIndex):
+                    try:
+                        info = cur.data(QtCore.Qt.ItemDataRole.UserRole)
+                        path = info.get("path") if isinstance(info, dict) else info
+                    except Exception:
+                        path = None
+                    log_debug(
+                        f"[thumb_currentChanged/heavy] row={cur.row() if cur.isValid() else -1} "
+                        f"path={path!r}"
+                    )
                     self._preview_from_thumb_index(cur)     # ← 事前に追加した共通ヘルパ
 
                 self._on_thumb_current_changed = _on_thumb_current_changed
@@ -8680,6 +9369,13 @@ class CropperApp(QtWidgets.QMainWindow):
                 pass
 
             def _on_thumb_current_changed(cur: QtCore.QModelIndex, prev: QtCore.QModelIndex):
+                try:
+                    info = cur.data(QtCore.Qt.ItemDataRole.UserRole)
+                    path = info.get("path") if isinstance(info, dict) else info
+                except Exception:
+                    info = None
+                    path = None
+
                 # 最後にフォルダを開いてからの経過時間（秒）
                 try:
                     import time
@@ -8687,29 +9383,34 @@ class CropperApp(QtWidgets.QMainWindow):
                 except Exception:
                     elapsed = 999.0
 
+                log_debug(
+                    f"[thumb_currentChanged] row={cur.row() if cur.isValid() else -1} "
+                    f"path={path!r} opening_folder={getattr(self, '_opening_folder', False)} "
+                    f"elapsed={elapsed:.6f}"
+                )
+
                 # 1) フォルダ貼り替え中 or 入場直後（揺り戻し期間）はプレビュー更新しない
                 if getattr(self, "_opening_folder", False) or elapsed < 0.08:  # ← 80ms デバウンス
+                    log_debug("[thumb_currentChanged] SKIP by opening_folder/debounce")
                     # ただし「最後に選んだ項目」は覚えておく（復元用）
                     try:
-                        info = cur.data(QtCore.Qt.ItemDataRole.UserRole)
-                        path = info.get("path") if isinstance(info, dict) else info
                         if path and getattr(self, "folder", None):
                             self._last_focus_by_dir[self._norm_path(self.folder)] = self._norm_path(path)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log_debug(f"[thumb_currentChanged] remember skipped-path error: {e!r}")
                     return
 
                 # 2) 通常時だけメインプレビューへ反映
+                log_debug(f"[thumb_currentChanged] PREVIEW row={cur.row() if cur.isValid() else -1} path={path!r}")
                 self._preview_from_thumb_index(cur)
 
                 # 3) 最後に選んだ項目を記憶（復元用）
                 try:
-                    info = cur.data(QtCore.Qt.ItemDataRole.UserRole)
-                    path = info.get("path") if isinstance(info, dict) else info
                     if path and getattr(self, "folder", None):
                         self._last_focus_by_dir[self._norm_path(self.folder)] = self._norm_path(path)
-                except Exception:
-                    pass
+                        log_debug(f"[thumb_currentChanged] remembered path={path!r}")
+                except Exception as e:
+                    log_debug(f"[thumb_currentChanged] remember path error: {e!r}")
 
             self._on_thumb_current_changed = _on_thumb_current_changed
             sm.currentChanged.connect(self._on_thumb_current_changed)
@@ -9075,7 +9776,7 @@ class CropperApp(QtWidgets.QMainWindow):
         #self.move_progress_widget()
      
     def on_thumbnail_clicked(self, index: QtCore.QModelIndex):
-        """サムネ単クリック：フォルダ→プレースホルダ表示、画像→即表示"""
+        """サムネ単クリック：フォルダ→プレースホルダ表示、画像→選択変更に任せる"""
         # open_folder 実行中は何もしない（再入防止）
         if getattr(self, "_opening_folder", False):
             return
@@ -9110,36 +9811,9 @@ class CropperApp(QtWidgets.QMainWindow):
                 pass
             return
 
-        # 画像はナビと同じルートで開く（UI温存トークン→open_image_from_path）
-        try:
-            if hasattr(self, "_prepare_preserve_for_nav"):
-                self._prepare_preserve_for_nav()
-        except Exception:
-            pass
-
-        # image_list 上の位置を同期（冪等）
-        try:
-            self.current_index = self.image_list.index(path)
-        except ValueError:
-            norm = norm_vpath(path)
-            self.current_index = next(
-                (i for i, p in enumerate(self.image_list)
-                if norm_vpath(p) == norm),
-                -1
-            )
-            if self.current_index < 0:
-                return
-
-        # ★ここが重要：load_image_by_index() は使わない
-        self.open_image_from_path(path)
-
-        # プレースホルダ解除 & カーソル戻し（従来の後処理）
-        self._placeholder_active = False
-        self._placeholder_path = ""
-        try:
-            self.label.setCursor(QtCore.Qt.CursorShape.CrossCursor)
-        except Exception:
-            pass
+        # 画像はここでは開かない
+        # 実際の表示切替は currentChanged -> _preview_from_thumb_index() に任せる
+        return
 
     def keyPressEvent(self, event):
         if (event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier) and \
@@ -9423,6 +10097,18 @@ class CropperApp(QtWidgets.QMainWindow):
             if hasattr(self, "custom_action") and self.custom_action.isChecked():
                 self.custom_action.setChecked(False)
 
+        prev_zoom = float(getattr(self, "zoom_scale", 1.0) or 1.0)
+
+        # 前の画像のズーム表示が残っていたら消す
+        self.zoom_label.clear_zoom()
+        log_debug(
+            f"[open] before clear_message "
+            f"path={file_path!r} current_index={getattr(self, 'current_index', None)} "
+            f"image_path_before={getattr(self, 'image_path', None)!r}"
+        )
+        self.clip_notice_label.clear_message()
+        log_debug(f"[open] after clear_message path={file_path!r}")
+
         self.zoom_scale = 1.0  # --- 画像切り替え時はズームリセット ---
         self.show_image()
 
@@ -9447,7 +10133,8 @@ class CropperApp(QtWidgets.QMainWindow):
 
         QtCore.QTimer.singleShot(0, self._prefetch_neighbors)
 
-        self.zoom_label.show_zoom(self.zoom_scale)
+        if abs(prev_zoom - 1.0) > 1e-9:
+            self.zoom_label.show_zoom(self.zoom_scale)
 
         if self.save_folder:
             text = f"保存先: {self.save_folder}"
@@ -9528,14 +10215,32 @@ class CropperApp(QtWidgets.QMainWindow):
     def on_progress_jump(self, value):
         if value < 1 or value > len(self.image_list):
             return
-        # 調整モードほかUI状態をスナップショット
-        snap = self._snapshot_adjust_state()
-        # 画像インデックス反映 → 読み込み
+
         index = value - 1
+
+        try:
+            path = self.image_list[index]
+        except Exception:
+            return
+
+        # 他のナビ系と同じ「次回だけUI温存」トークンを積む
+        try:
+            if hasattr(self, "_prepare_preserve_for_nav"):
+                self._prepare_preserve_for_nav()
+        except Exception:
+            pass
+
+        # current_index を先に同期
         self.current_index = index
-        self.load_image_by_index(self.current_index)
-        # 調整モード/パネルを復元
-        self._restore_adjust_state(snap)
+
+        # load_image_by_index ではなく、他のナビと同じ open_image_from_path ルートへ寄せる
+        self.open_image_from_path(path)
+
+        # サムネ選択も同期
+        try:
+            self._sync_thumb_selection()
+        except Exception:
+            pass
 
     def show_prev_image(self, *args):
         # サムネイル欄の「現在行」を1つ左（前）へ。
@@ -9625,10 +10330,13 @@ class CropperApp(QtWidgets.QMainWindow):
             preserve["nudge"] = bool(getattr(self, "_nudge_overlay", None) and self._nudge_overlay.isVisible())
 
             try:
-                cur_fixed = (
-                    getattr(lbl, "fixed_crop_rect_img_base", None)
-                    or getattr(lbl, "fixed_crop_rect_img", None)
-                )
+                if bool(getattr(self, "constrain_crop_to_image", False)) and getattr(lbl, "fixed_crop_rect_img", None) is not None:
+                    cur_fixed = getattr(lbl, "fixed_crop_rect_img", None)
+                else:
+                    cur_fixed = (
+                        getattr(lbl, "fixed_crop_rect_img_base", None)
+                        or getattr(lbl, "fixed_crop_rect_img", None)
+                    )
                 pending_overlay = preserve.get("post_save_overlay_rect_img")
                 pending_original = preserve.get("post_save_original_fixed_rect_img")
 
@@ -10223,11 +10931,18 @@ class CropperApp(QtWidgets.QMainWindow):
 
     def _preview_from_thumb_index(self, index: QtCore.QModelIndex):
         """サムネ選択中の項目をメインプレビューに反映（画像=画像表示 / フォルダ=プレースホルダ）"""
+        log_debug(
+            f"[preview] enter valid={index.isValid()} row={index.row() if index.isValid() else -1} "
+            f"handling_missing={getattr(self, '_handling_missing_image', False)}"
+        )
+
         # 欠損画像処理中はここからの再入を抑止（行削除で currentChanged が飛んできても無視する）
         if getattr(self, "_handling_missing_image", False):
+            log_debug("[preview] skip: _handling_missing_image is True")
             return
 
         if not index.isValid():
+            log_debug("[preview] skip: invalid index")
             return
 
         info = index.data(QtCore.Qt.ItemDataRole.UserRole) or {}
@@ -10241,7 +10956,13 @@ class CropperApp(QtWidgets.QMainWindow):
             except Exception:
                 is_dir = False
 
+        log_debug(
+            f"[preview] resolved path={path!r} is_dir={is_dir} "
+            f"image_path_now={getattr(self, 'image_path', None)!r} "
+            f"current_index_now={getattr(self, 'current_index', None)}"
+        )
         if not path:
+            log_debug("[preview] skip: resolved path is empty")
             return
 
         # 正規化ヘルパ（_norm_path が無くても動くようフォールバック）
@@ -10255,37 +10976,38 @@ class CropperApp(QtWidgets.QMainWindow):
                     return (p or "").lower()
 
         if is_dir:
+            log_debug(f"[preview] folder placeholder path={path!r}")
             t0 = _dbg_time(f"preview_dir start: {path}")
             try:
                 self._show_folder_placeholder(path, force=True)
-            except Exception:
-                pass
+            except Exception as e:
+                log_debug(f"[preview] _show_folder_placeholder error: {e!r}")
             _dbg_time(f"preview_dir end:   {path}", t0)
 
             # ▼ 左下のフルパス（フォルダパス表示＋OSアイコン）
             try:
                 self.set_path_text(self._format_dir_path_text(path))
                 self._update_path_icon_for_folder(path)
-            except Exception:
-                pass
+            except Exception as e:
+                log_debug(f"[preview] folder path UI update error: {e!r}")
 
             # ▼ 追加：中央ラベルはフォルダ名に（必要なら“枚数”など好みで）
             try:
                 self._update_center_label_for_folder(path)
-                # 例：枚数も出すなら → self.image_info_label.setText(f"{os.path.basename(path)}  —  {len(self.image_list)} 枚")
-            except Exception:
-                pass
+            except Exception as e:
+                log_debug(f"[preview] center label folder update error: {e!r}")
 
             try:
                 self.current_index = -1  # フォルダなので画像インデックスは無効
-            except Exception:
-                pass
+                log_debug("[preview] current_index set -> -1 (folder)")
+            except Exception as e:
+                log_debug(f"[preview] current_index set error (folder): {e!r}")
 
             # ★ ここで進捗表示をニュートラルにリセット
             try:
                 self._clear_progress_display()
-            except Exception:
-                pass
+            except Exception as e:
+                log_debug(f"[preview] _clear_progress_display error: {e!r}")
 
             return
 
@@ -10293,9 +11015,10 @@ class CropperApp(QtWidgets.QMainWindow):
         try:
             cur = getattr(self, "image_path", "")
             if cur and _N(cur) == _N(path):
+                log_debug(f"[preview] skip same file path={path!r}")
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            log_debug(f"[preview] same-file check error #1: {e!r}")
 
         # image_list 上のインデックスを同期（見つからなければ -1）
         tgt = -1
@@ -10304,20 +11027,22 @@ class CropperApp(QtWidgets.QMainWindow):
                 if _N(p) == _N(path):
                     tgt = i
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            log_debug(f"[preview] image_list scan error #1: {e!r}")
         try:
             self.current_index = tgt
-        except Exception:
-            pass
+            log_debug(f"[preview] current_index set #1 -> {tgt}")
+        except Exception as e:
+            log_debug(f"[preview] current_index set error #1: {e!r}")
 
         # 画像：同一ファイルなら何もしない（重複オープン抑止）
         try:
             cur = getattr(self, "image_path", "")
             if cur and _N(cur) == _N(path):
+                log_debug(f"[preview] skip same file after sync path={path!r}")
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            log_debug(f"[preview] same-file check error #2: {e!r}")
 
         # image_list 上のインデックスを同期（見つからなければ -1）
         tgt = -1
@@ -10326,41 +11051,49 @@ class CropperApp(QtWidgets.QMainWindow):
                 if _N(p) == _N(path):
                     tgt = i
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            log_debug(f"[preview] image_list scan error #2: {e!r}")
         try:
             self.current_index = tgt
-        except Exception:
-            pass
+            log_debug(f"[preview] current_index set #2 -> {tgt}")
+        except Exception as e:
+            log_debug(f"[preview] current_index set error #2: {e!r}")
 
         # 画像を開く（VFS対応版：zip:// も含めて一律 open_image_from_path に任せる）
         try:
             if hasattr(self, "_prepare_preserve_for_nav"):
                 self._prepare_preserve_for_nav()
-        except Exception:
-            pass
+                log_debug("[preview] _prepare_preserve_for_nav done")
+        except Exception as e:
+            log_debug(f"[preview] _prepare_preserve_for_nav error: {e!r}")
 
         self._suspend_chain_clear = getattr(self, "_suspend_chain_clear", 0) + 1
+        log_debug(f"[preview] suspend_chain_clear -> {self._suspend_chain_clear}")
         try:
+            log_debug(f"[preview] OPEN path={path!r} current_index={getattr(self, 'current_index', None)}")
             self.open_image_from_path(path)
+            log_debug(f"[preview] OPEN done path={path!r}")
         except Exception as e:
             log_debug("[preview] open_image_from_path error:", e)
             # 万一「実はフォルダ扱い」だった場合だけフォールダープレビューにフォールバック
             try:
                 if vfs_is_dir(path):
+                    log_debug(f"[preview] fallback to folder placeholder path={path!r}")
                     self._show_folder_placeholder(path, force=True)
                     self.current_index = -1
                     return
-            except Exception:
-                pass
+            except Exception as e2:
+                log_debug(f"[preview] fallback dir check error: {e2!r}")
         finally:
             self._suspend_chain_clear -= 1
+            log_debug(f"[preview] suspend_chain_clear <- {self._suspend_chain_clear}")
 
         # サムネ側の選択同期（失敗しても無視）
         try:
             self._sync_thumb_selection()
-        except Exception:
-            pass
+            log_debug("[preview] _sync_thumb_selection done")
+        except Exception as e:
+            log_debug(f"[preview] _sync_thumb_selection error: {e!r}")
 
     def navigate_from_gesture(self, direction, modifiers=None) -> None:
         mods = modifiers if modifiers is not None else QtWidgets.QApplication.keyboardModifiers()
@@ -10583,7 +11316,36 @@ class CropperApp(QtWidgets.QMainWindow):
                 self._scaled_key = key_now
 
             scaled = self._scaled_pixmap
-            self.label._view_rect_scaled = QtCore.QRect(0, 0, scaled.width(), scaled.height())
+
+            # ★ 保険:
+            #   base_display_* と実際の scaled サイズが食い違っていたら、
+            #   実表示サイズに同期し直して座標系のズレを防ぐ
+            if scaled is None or scaled.isNull():
+                if img_w <= label_w and img_h <= label_h:
+                    scaled = self.img_pixmap
+                else:
+                    scaled = self.img_pixmap.scaled(
+                        label_w, label_h,
+                        QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                        QtCore.Qt.TransformationMode.SmoothTransformation
+                    )
+                self._scaled_pixmap = scaled
+
+            actual_w = int(scaled.width())
+            actual_h = int(scaled.height())
+
+            if (int(self.base_display_width or 0) != actual_w or
+                int(self.base_display_height or 0) != actual_h):
+                log_debug(
+                    "[show_image] sync base_display to actual scaled size "
+                    f"base_before=({self.base_display_width}x{self.base_display_height}) "
+                    f"actual=({actual_w}x{actual_h})"
+                )
+                self.base_display_width = actual_w
+                self.base_display_height = actual_h
+                self._scaled_key = (base_key, actual_w, actual_h, 1.0, False)
+
+            self.label._view_rect_scaled = QtCore.QRect(0, 0, actual_w, actual_h)
             display_pixmap = scaled
 
         else:
@@ -10641,6 +11403,31 @@ class CropperApp(QtWidgets.QMainWindow):
 
         self.label.setPixmap(display_pixmap)
 
+        try:
+            pm = self.label.pixmap()
+            vr = getattr(self.label, "_view_rect_scaled", None)
+            if pm and not pm.isNull():
+                log_debug(
+                    "[geom] show_image after setPixmap "
+                    f"zoom={getattr(self, 'zoom_scale', None)} "
+                    f"base=({getattr(self, 'base_display_width', None)}x"
+                    f"{getattr(self, 'base_display_height', None)}) "
+                    f"pixmap=({pm.width()}x{pm.height()}) "
+                    f"label=({self.label.width()}x{self.label.height()}) "
+                    f"view_rect={vr}"
+                )
+            else:
+                log_debug(
+                    "[geom] show_image after setPixmap pixmap=None "
+                    f"zoom={getattr(self, 'zoom_scale', None)} "
+                    f"base=({getattr(self, 'base_display_width', None)}x"
+                    f"{getattr(self, 'base_display_height', None)}) "
+                    f"label=({self.label.width()}x{self.label.height()}) "
+                    f"view_rect={vr}"
+                )
+        except Exception as e:
+            log_debug(f"[geom] show_image log error: {e!r}")
+
         # センタリング用のオフセットを更新（既存ロジック流用）
         lw, lh = self.label.width(), self.label.height()
         pw, ph = display_pixmap.width(), display_pixmap.height()
@@ -10649,7 +11436,6 @@ class CropperApp(QtWidgets.QMainWindow):
 
         self.label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.label.update()
-        self.zoom_label.show_zoom(self.zoom_scale)
 
         # デバッグ
         vr = getattr(self.label, "_view_rect_scaled", None)
@@ -10918,6 +11704,7 @@ class CropperApp(QtWidgets.QMainWindow):
         # ズーム値更新＆再描画
         self.zoom_scale = round(new, 2)
         self.show_image()
+        self.zoom_label.show_zoom(self.zoom_scale)
 
     def zoom_out(self):
         # 画像・基準サイズが未確定なら何もしない
@@ -10958,6 +11745,7 @@ class CropperApp(QtWidgets.QMainWindow):
             self.label._pan_offset_y = 0
 
         self.show_image()
+        self.zoom_label.show_zoom(self.zoom_scale)
 
     def _record_batch_transform(self, op: str):
         """
@@ -11043,6 +11831,11 @@ class CropperApp(QtWidgets.QMainWindow):
         # 固定枠モードなら、UIを最新座標に同期
         try:
             self._sync_fixed_ui_after_image_change()
+        except Exception:
+            pass
+
+        try:
+            self._apply_current_crop_constrain(notify=True)
         except Exception:
             pass
 
@@ -11133,6 +11926,11 @@ class CropperApp(QtWidgets.QMainWindow):
         # 固定枠モードなら、UIを最新座標に同期
         try:
             self._sync_fixed_ui_after_image_change()
+        except Exception:
+            pass
+
+        try:
+            self._apply_current_crop_constrain(notify=True)
         except Exception:
             pass
 
@@ -11267,6 +12065,11 @@ class CropperApp(QtWidgets.QMainWindow):
         # 固定枠モードならUI同期
         try:
             self._sync_fixed_ui_after_image_change()
+        except Exception:
+            pass
+
+        try:
+            self._apply_current_crop_constrain(notify=True)
         except Exception:
             pass
 
@@ -11945,7 +12748,12 @@ class CropperApp(QtWidgets.QMainWindow):
         # ★ ここが重要：画像座標は round-trip せず drag_rect_img をそのまま使う
         img_rect = getattr(self.label, "drag_rect_img", None)
         if img_rect is not None:
-            self._crop_rect_img = img_rect
+            self._crop_rect_img = QtCore.QRect(img_rect)
+            if bool(getattr(self, "constrain_crop_to_image", False)):
+                try:
+                    self._apply_current_crop_constrain(notify=False)
+                except Exception:
+                    pass
         else:
             # フォールバック（念のため）
             gx1, gy1 = self.label.label_to_image_coords(rect.left(), rect.top())
@@ -11970,7 +12778,13 @@ class CropperApp(QtWidgets.QMainWindow):
         img_rect = getattr(self.label, "fixed_crop_rect_img", None)
         if img_rect is None:
             return
-        self._crop_rect_img = img_rect
+        self._crop_rect_img = QtCore.QRect(img_rect)
+        if bool(getattr(self, "constrain_crop_to_image", False)):
+            try:
+                self._apply_current_crop_constrain(notify=False)
+                rect = self._current_fixed_label_rect() or rect
+            except Exception:
+                pass
 
         # パネル表示（位置決めはラベル座標の rect でOK）
         # ★ 中ボタントグルでユーザーが「今はパネル要らない」としている間は勝手に出さない
@@ -11982,7 +12796,7 @@ class CropperApp(QtWidgets.QMainWindow):
 
         # プレビューも画像座標の矩形をそのまま渡す
         self._schedule_preview(self._crop_rect_img)
-        self._ensure_aspect_base_from_current_rect()
+        # ★ 比率固定の基準は、移動/リサイズ確定のたびには取り直さない
 
     def show_action_panel(self, rect, mouse_pos):
         if not rect or (hasattr(rect, "isNull") and rect.isNull()):
@@ -12013,6 +12827,11 @@ class CropperApp(QtWidgets.QMainWindow):
             on_adjust=self.on_click_adjust,
             on_cancel=self.on_action_cancel,
             is_fixed=is_fixed,
+        )
+
+        # 解像度インライン編集中は ActionPanel 側の Esc を無効化
+        self._set_action_panel_escape_enabled(
+            not bool(getattr(self, "_crop_size_editing", False))
         )
 
         # 32/64pxモードのときは調整ボタンを無効化
@@ -12401,8 +13220,7 @@ class CropperApp(QtWidgets.QMainWindow):
 
         left, top, right, bottom = r.left(), r.top(), r.right(), r.bottom()
 
-        # ==== 画像端によるクランプは一切しない ====
-        # ただし幅・高さが 1px 未満にならないように、反対側との関係だけ制限する
+        # 幅・高さが 1px 未満にならないようにしつつ、制限ON時は操作中の辺だけを画像端で止める
         applied = 0
         if side == "top":
             old = top
@@ -12430,6 +13248,22 @@ class CropperApp(QtWidgets.QMainWindow):
             old_edge, new_edge = old, new
         else:
             return 0
+
+        if bool(getattr(self, "constrain_crop_to_image", False)) and getattr(self, "image", None) is not None:
+            img_w, img_h = self.image.size
+            if side == "top":
+                top = max(0, min(top, bottom - 1))
+            elif side == "bottom":
+                bottom = min(img_h - 1, max(bottom, top + 1))
+            elif side == "left":
+                left = max(0, min(left, right - 1))
+            elif side == "right":
+                right = min(img_w - 1, max(right, left + 1))
+            new_edge = {"top": top, "bottom": bottom, "left": left, "right": right}[side]
+            applied = new_edge - old_edge
+            applied_for_counter = applied
+        else:
+            applied_for_counter = applied
 
         new_rect = QtCore.QRect(QtCore.QPoint(left, top), QtCore.QPoint(right, bottom))
 
@@ -12459,8 +13293,7 @@ class CropperApp(QtWidgets.QMainWindow):
             if v > vmax: return +1
             return 0
 
-        applied_for_counter = applied
-        if img_w is not None and img_h is not None:
+        if img_w is not None and img_h is not None and not bool(getattr(self, "constrain_crop_to_image", False)):
             if side in ("top", "bottom"):
                 vmin, vmax = 0, img_h - 1
             else:
@@ -12620,6 +13453,11 @@ class CropperApp(QtWidgets.QMainWindow):
         if not (self.label.fixed_crop_mode and
                 getattr(self.label, "fixed_crop_rect_img", None) is not None):
             return
+
+        try:
+            self._apply_current_crop_constrain(notify=True)
+        except Exception:
+            pass
 
         # 画像座標 → ラベル座標に変換して最新化
         rect_now = self._current_fixed_label_rect()
@@ -13495,7 +14333,13 @@ class CropperApp(QtWidgets.QMainWindow):
             gx1, gy1 = self.label.label_to_image_coords(x1, y1)
             gx2, gy2 = self.label.label_to_image_coords(x2, y2)
             img_rect = QtCore.QRect(min(gx1, gx2), min(gy1, gy2), abs(gx2 - gx1), abs(gy2 - gy1))
-        self._crop_rect_img = img_rect
+        self._crop_rect_img = QtCore.QRect(img_rect)
+        if bool(getattr(self, "constrain_crop_to_image", False)):
+            try:
+                self._apply_current_crop_constrain(notify=False)
+                rect = getattr(self, "_crop_rect", rect)
+            except Exception:
+                pass
 
         if self._action_panel:
             is_fixed = getattr(self.label, "fixed_crop_mode", False) and \
@@ -13511,6 +14355,11 @@ class CropperApp(QtWidgets.QMainWindow):
         現在の選択矩形（画像座標）を固定枠に昇格させ、
         パン/ズームや画像移動時にも維持させる。
         """
+        log_debug(
+            f"[crop-edit] pin_current_rect fixed_mode={getattr(self.label, 'fixed_crop_mode', None)!r} "
+            f"drag_rect_img={getattr(self.label, 'drag_rect_img', None)!r} "
+            f"_crop_rect_img={getattr(self, '_crop_rect_img', None)!r}"
+        )
         # すでに固定枠なら何もしない
         if self.label.fixed_crop_mode and getattr(self.label, "fixed_crop_rect_img", None) is not None:
             return
@@ -13835,18 +14684,51 @@ class CropperApp(QtWidgets.QMainWindow):
             except Exception:
                 pass
         # Cancel：何もしない
+    def _set_action_panel_escape_enabled(self, enabled: bool):
+        try:
+            panel = getattr(self, "_action_panel", None)
+            if panel is None:
+                return
+
+            sc = getattr(panel, "sc_cancel", None)
+            if sc is not None:
+                sc.setEnabled(bool(enabled))
+        except Exception:
+            pass
 
     def _on_crop_size_edit_started(self):
         self._crop_size_editing = True
+        self._set_action_panel_escape_enabled(False)
 
     def _on_crop_size_edit_finished(self):
         self._crop_size_editing = False
+        self._set_action_panel_escape_enabled(True)
+
+        try:
+            w = getattr(self, "crop_size_label", None)
+            cancelled = getattr(w, "_cancelled_by_escape", None) if w is not None else None
+            log_debug(f"[crop-edit] edit_finished cancelled_by_escape={cancelled!r}")
+            if w is not None and bool(cancelled):
+                w._cancelled_by_escape = False
+                log_debug("[crop-edit] edit_finished return by cancelled_by_escape")
+                return
+        except Exception as e:
+            log_debug(f"[crop-edit] edit_finished exception={e!r}")
+            pass
 
     def _on_crop_size_inline_confirmed(self, w: int, h: int):
+        log_debug(
+            f"[crop-edit] inline_confirmed w={w} h={h} "
+            f"fixed_mode={getattr(self.label, 'fixed_crop_mode', None)!r} "
+            f"fixed_size={getattr(self.label, 'fixed_crop_size', None)!r} "
+            f"aspect_lock={getattr(self.label, '_aspect_lock', None)!r}"
+        )
         new_size = (int(w), int(h))
         self.custom_size = new_size
         self.update_custom_edit_action_text()
 
+        # 同じ固定サイズを入れた場合は何もしない
+        # （固定解除にはせず、そのまま維持する）
         try:
             if (
                 getattr(self.label, "fixed_crop_mode", False)
@@ -13865,7 +14747,7 @@ class CropperApp(QtWidgets.QMainWindow):
                             panel.update_aspect_base(new_size)
                     except Exception:
                         pass
-                    return
+                return
         except Exception:
             pass
 
@@ -14008,6 +14890,12 @@ class CropperApp(QtWidgets.QMainWindow):
             pass
 
     def fixed_crop_triggered(self, size_tuple, from_toggle: bool = False):
+        log_debug(
+            f"[crop-edit] fixed_crop_triggered size={size_tuple!r} "
+            f"from_toggle={from_toggle!r} "
+            f"current_fixed={getattr(self.label, 'fixed_crop_mode', None)!r} "
+            f"current_size={getattr(self.label, 'fixed_crop_size', None)!r}"
+        )
         current = self.label.fixed_crop_mode and self.label.fixed_crop_size == size_tuple
         if current:
             self.label.clear_fixed_crop()
@@ -14202,7 +15090,21 @@ class CropperApp(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        # ③ パネル復帰（現在の画像に矩形がある場合のみ）
+        # ③ 制限モードONなら復元直後に一度補正
+        try:
+            changed = bool(self._apply_current_crop_constrain(notify=True))
+        except Exception:
+            changed = False
+
+        # ★ 実際に補正が起きていて、かつ比率固定ONなら
+        #    基準表示と内部比率値を現在矩形へ同期
+        if changed and bool(getattr(self.label, "_aspect_lock", False)):
+            try:
+                self._sync_aspect_base_to_current()
+            except Exception:
+                pass
+
+        # ④ パネル復帰（現在の画像に矩形がある場合のみ）
         try:
             is_fixed = bool(self.label.fixed_crop_mode and (self.label.fixed_crop_rect_img is not None))
             r = self._current_fixed_label_rect() if is_fixed else getattr(self, "_crop_rect", None)
@@ -14211,6 +15113,174 @@ class CropperApp(QtWidgets.QMainWindow):
                 self.show_action_panel(r, pos)
         except Exception:
             pass
+
+    def _sync_fixed_rect_base_to_current(self) -> None:
+        """
+        固定矩形の「ナビ用基準矩形」を、現在実際に表示・採用されている固定矩形へ同期する。
+        画像外禁止ONで見た目だけ補正され、baseが古いまま残るのを防ぐ。
+        """
+        try:
+            if not getattr(self.label, "fixed_crop_mode", False):
+                return
+
+            cur = getattr(self.label, "fixed_crop_rect_img", None)
+            if cur is None or cur.isNull():
+                return
+
+            self.label.fixed_crop_rect_img_base = QtCore.QRect(cur)
+            log_debug(
+                "[constrain] sync fixed base <- current =",
+                tuple(self.label.fixed_crop_rect_img_base.getRect())
+            )
+        except Exception as e:
+            log_debug("[constrain] sync fixed base error:", repr(e))
+    
+    def _sync_aspect_base_to_current(self) -> None:
+        """
+        比率固定ON時の「基準: W x H」表示を、現在実際に採用されている矩形サイズへ同期する。
+        画像外禁止ONで矩形が切り詰められた後、基準表示だけ古いまま残るのを防ぐ。
+        """
+        try:
+            if not bool(getattr(self.label, "_aspect_lock", False)):
+                return
+
+            r = None
+            if getattr(self.label, "fixed_crop_mode", False) and getattr(self.label, "fixed_crop_rect_img", None) is not None:
+                r = self.label.fixed_crop_rect_img
+            elif getattr(self.label, "drag_rect_img", None) is not None:
+                r = self.label.drag_rect_img
+            elif getattr(self, "_crop_rect_img", None) is not None:
+                r = self._crop_rect_img
+
+            if r is None or r.isNull() or r.width() <= 0 or r.height() <= 0:
+                return
+
+            base = (int(r.width()), int(r.height()))
+            self.label._aspect_base_wh = base
+            try:
+                self.label._aspect_ratio = base[0] / base[1]
+            except Exception:
+                self.label._aspect_ratio = None
+
+            panel = getattr(self, "_nudge_overlay", None)
+            if panel and hasattr(panel, "update_aspect_base"):
+                panel.update_aspect_base(base)
+
+            log_debug("[constrain] sync aspect base <- current =", base)
+
+        except Exception as e:
+            log_debug("[constrain] sync aspect base error:", repr(e))
+
+    def _on_constrain_crop_toggled(self, checked):
+        self.constrain_crop_to_image = bool(checked)
+
+        try:
+            if hasattr(self, "settings"):
+                self.settings.setValue("constrain_crop_to_image", self.constrain_crop_to_image)
+        except Exception:
+            pass
+
+        try:
+            cb = getattr(self, "chk_constrain_crop_quick", None)
+            if cb is not None and cb.isChecked() != self.constrain_crop_to_image:
+                blocker = QSignalBlocker(cb)
+                cb.setChecked(self.constrain_crop_to_image)
+                del blocker
+        except Exception:
+            pass
+
+        if self.constrain_crop_to_image:
+            changed = False
+            try:
+                changed = bool(self._apply_current_crop_constrain(notify=True))
+            except Exception as e:
+                log_debug("[constrain] toggle apply error:", repr(e))
+
+            try:
+                self._sync_fixed_rect_base_to_current()
+            except Exception as e:
+                log_debug("[constrain] toggle sync base error:", repr(e))
+
+            # ★ 実際に切り詰め・補正が発生した時だけ、比率固定の基準を現在矩形へ同期
+            if changed:
+                try:
+                    self._sync_aspect_base_to_current()
+                except Exception as e:
+                    log_debug("[constrain] toggle sync aspect base error:", repr(e))
+
+    def _toggle_constrain_crop_shortcut(self):
+        cb = getattr(self, "chk_constrain_crop_quick", None)
+        if cb is None:
+            return
+        try:
+            cb.setChecked(not bool(cb.isChecked()))
+        except Exception:
+            pass
+
+    def show_crop_clip_notice(self):
+        try:
+            log_debug("[clip_notice] REQUEST show_crop_clip_notice")
+            self.clip_notice_label.flash_message("画像内に収まらないため矩形を切り詰めました")
+        except Exception:
+            pass
+
+    def _apply_current_crop_constrain(self, notify: bool = False) -> bool:
+        if not bool(getattr(self, "constrain_crop_to_image", False)):
+            return False
+        img = getattr(self, "image", None)
+        if img is None:
+            return False
+
+        changed = False
+        clipped = False
+        bounds = QtCore.QRect(0, 0, int(img.width), int(img.height))
+
+        if getattr(self.label, "fixed_crop_mode", False) and getattr(self.label, "fixed_crop_rect_img", None) is not None:
+            new_rect, clipped = self.label._adjust_existing_rect_into_image(self.label.fixed_crop_rect_img)
+            if new_rect is not None:
+                if QtCore.QRect(self.label.fixed_crop_rect_img) != QtCore.QRect(new_rect):
+                    changed = True
+                self.label.fixed_crop_rect_img = QtCore.QRect(new_rect)
+                try:
+                    self.label.fixed_crop_size = (int(new_rect.width()), int(new_rect.height()))
+                except Exception:
+                    pass
+                self._crop_rect_img = QtCore.QRect(new_rect)
+                self._crop_rect = self.label._fixed_rect_labelcoords()
+        elif getattr(self.label, "drag_rect_img", None) is not None:
+            new_rect, clipped = self.label._adjust_existing_rect_into_image(self.label.drag_rect_img)
+            if new_rect is not None:
+                if QtCore.QRect(self.label.drag_rect_img) != QtCore.QRect(new_rect):
+                    changed = True
+                self.label.drag_rect_img = QtCore.QRect(new_rect)
+                self._crop_rect_img = QtCore.QRect(new_rect)
+                self._crop_rect = self.label._drag_rect_labelcoords()
+        else:
+            return False
+
+        if self._crop_rect_img is None or self._crop_rect_img.isNull():
+            self._crop_rect = None
+
+        # ★追加：固定矩形を補正した場合、ナビ用baseも必ず現在矩形へ同期
+        try:
+            self._sync_fixed_rect_base_to_current()
+        except Exception as e:
+            log_debug("[constrain] apply sync base error:", repr(e))
+
+        if notify and clipped:
+            self.show_crop_clip_notice()
+
+        if getattr(self, "_crop_rect_img", None) is not None:
+            self.update_crop_size_label(self._crop_rect_img, img_space=True)
+            self._schedule_preview(self._crop_rect_img.intersected(bounds))
+        else:
+            self.update_crop_size_label(None)
+            self._set_preview_placeholder()
+        try:
+            self.label.update()
+        except Exception:
+            pass
+        return changed or clipped
 
     def move_progress_widget(self):
         # QStatusBarを使う場合は手動で位置を動かす必要なし
@@ -15259,7 +16329,7 @@ class _TipPopup(QtWidgets.QFrame):
 
         # 見た目パラメータ（柔らかめ）
         self._radius = 10
-        self._bg = QtGui.QColor(18, 18, 18, 190)       # 黒に近いグレー、やや透過
+        self._bg = QtGui.QColor(18, 18, 18, 255)
         self._border = QtGui.QColor(255, 255, 255, 22) # ごく薄い縁
         self._border_w = 1
         self._max_w = 360
@@ -15338,6 +16408,124 @@ class _TipPopup(QtWidgets.QFrame):
         self._last_text = ""
         self._last_pos = QtCore.QPoint(-9999, -9999)
 
+
+class _SoftTipFilter(QtCore.QObject):
+    """標準 QToolTip を使わず、_TipPopup で表示する共通イベントフィルタ。"""
+
+    def __init__(self, popup: "_TipPopup", text_getter=None, parent=None):
+        super().__init__(parent)
+        self._popup = popup
+        self._text_getter = text_getter
+        self._active = False
+
+    def _event_global_pos(self, obj, ev) -> QtCore.QPoint:
+        if hasattr(ev, "globalPos"):
+            try:
+                return ev.globalPos()
+            except Exception:
+                pass
+
+        if hasattr(ev, "globalPosition"):
+            gp = ev.globalPosition()
+            return QtCore.QPoint(int(gp.x()), int(gp.y()))
+
+        if hasattr(ev, "position"):
+            p = ev.position()
+            try:
+                p = p.toPoint()
+            except Exception:
+                p = QtCore.QPoint(int(p.x()), int(p.y()))
+            try:
+                return obj.mapToGlobal(p)
+            except Exception:
+                pass
+
+        return QtGui.QCursor.pos()
+
+    def _get_text(self, obj) -> str:
+        try:
+            if callable(self._text_getter):
+                text = self._text_getter()
+            elif isinstance(self._text_getter, str):
+                text = self._text_getter
+            else:
+                text = obj.toolTip() if hasattr(obj, "toolTip") else ""
+        except Exception:
+            text = obj.toolTip() if hasattr(obj, "toolTip") else ""
+
+        return str(text or "").strip()
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+
+        if t == QtCore.QEvent.Type.ToolTip:
+            text = self._get_text(obj)
+            if text:
+                self._popup.show_text(text, self._event_global_pos(obj, ev))
+                self._active = True
+            else:
+                self._popup.hide()
+                self._active = False
+            return True
+
+        elif t in (
+            QtCore.QEvent.Type.Leave,
+            QtCore.QEvent.Type.Hide,
+            QtCore.QEvent.Type.WindowDeactivate,
+            QtCore.QEvent.Type.MouseButtonPress,
+        ):
+            self._popup.hide()
+            self._active = False
+            return False
+
+        elif t == QtCore.QEvent.Type.MouseMove:
+            if self._active:
+                text = self._get_text(obj)
+                if text:
+                    self._popup.show_text(text, self._event_global_pos(obj, ev))
+                else:
+                    self._popup.hide()
+                    self._active = False
+            return False
+
+        return False
+
+
+def _install_softtip(widget, text_getter=None):
+    if widget is None:
+        return None
+
+    filt = getattr(widget, "_softtip_filter", None)
+    if filt is not None:
+        if text_getter is not None:
+            filt._text_getter = text_getter
+        return filt
+
+    popup = _TipPopup(None)
+    filt = _SoftTipFilter(popup, text_getter=text_getter, parent=widget)
+
+    widget._softtip_popup = popup
+    widget._softtip_filter = filt
+    widget.installEventFilter(filt)
+    return filt
+
+
+def _install_softtip_recursive(root):
+    if root is None:
+        return
+
+    try:
+        _install_softtip(root)
+    except Exception:
+        pass
+
+    for w in root.findChildren(QtWidgets.QWidget):
+        try:
+            _install_softtip(w)
+        except Exception:
+            pass
+
+
 class _SuccessToast(QtWidgets.QFrame):
     """最前面の小さな Success トースト（常に前面）"""
     def __init__(self, parent=None):
@@ -15391,6 +16579,16 @@ if __name__ == "__main__":
     log_debug(f"[ENV] VIRTUAL_ENV   = {os.environ.get('VIRTUAL_ENV')}")
 
     app = QtWidgets.QApplication(sys.argv)
+
+    app.setStyleSheet(app.styleSheet() + """
+    QToolTip {
+        color: #f2f2f2;
+        background-color: #2b2b2b;
+        border: 1px solid #6a6a6a;
+        padding: 4px 8px;
+    }
+    """)
+
     win = CropperApp()
     win.show()
     sys.exit(app.exec())
