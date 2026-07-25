@@ -208,3 +208,4 @@ __marimo__/
 
 # --- gazou_kiritori: Hugging Face cache / token（ローカル専用） ---
 hf_home/
+config/
