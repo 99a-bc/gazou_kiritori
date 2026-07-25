@@ -30,7 +30,6 @@ except ModuleNotFoundError:
     )
 
 from PIL import Image
-from PyQt6 import QtWidgets
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -101,7 +100,6 @@ class ImportSmokeTests(unittest.TestCase):
                     "TRANSFORMERS_CACHE": str(sandbox / "transformers-cache"),
                     "HF_HUB_OFFLINE": "1",
                     "TRANSFORMERS_OFFLINE": "1",
-                    "CUDA_VISIBLE_DEVICES": "",
                     "GAZOU_BG_DEBUG": "0",
                     "GAZOU_KIRITORI_BG_DEBUG": "0",
                 }
@@ -153,14 +151,17 @@ class ImportSmokeTests(unittest.TestCase):
 
 class QApplicationHelperTests(unittest.TestCase):
     def test_qapplication_is_offscreen_reused_and_does_not_start_exec(self) -> None:
-        self.assertEqual(os.environ["QT_QPA_PLATFORM"], "offscreen")
+        previous_platform = os.environ.get("QT_QPA_PLATFORM")
+        application = get_qapplication()
+
+        from PyQt6 import QtWidgets
 
         with mock.patch.object(QtWidgets.QApplication, "exec") as event_loop:
-            application = get_qapplication()
             reused_application = get_qapplication()
 
         self.assertIs(application, reused_application)
         self.assertEqual(application.platformName().lower(), "offscreen")
+        self.assertEqual(os.environ.get("QT_QPA_PLATFORM"), previous_platform)
         event_loop.assert_not_called()
         self.assertFalse(
             any(widget.isVisible() for widget in application.topLevelWidgets())

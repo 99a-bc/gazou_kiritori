@@ -8,20 +8,13 @@ import tempfile
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-from typing import Iterator
-
-# These must be set before importing PyQt6 or the application module.
-os.environ["QT_QPA_PLATFORM"] = "offscreen"
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+from typing import Any, Iterator
 
 from PIL import Image
-from PyQt6 import QtCore, QtWidgets
 
 
 _qt_settings_directory: tempfile.TemporaryDirectory[str] | None = None
-_qapplication: QtWidgets.QApplication | None = None
+_qapplication: Any = None
 
 
 def _cleanup_qt_settings_directory() -> None:
@@ -34,38 +27,50 @@ def _cleanup_qt_settings_directory() -> None:
 atexit.register(_cleanup_qt_settings_directory)
 
 
-def get_qapplication() -> QtWidgets.QApplication:
+def get_qapplication() -> Any:
     """Return a reusable offscreen QApplication without starting its event loop."""
     global _qapplication, _qt_settings_directory
 
-    if _qt_settings_directory is None:
-        _qt_settings_directory = tempfile.TemporaryDirectory(
-            prefix="gazou-kiritori-qt-settings-",
-        )
+    previous_platform = os.environ.get("QT_QPA_PLATFORM")
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    try:
+        # Import Qt only when a test explicitly asks for a QApplication. This
+        # preserves the application's required Torch-before-PyQt6 import order.
+        from PyQt6 import QtCore, QtWidgets
 
-    settings_path = _qt_settings_directory.name
-    QtCore.QStandardPaths.setTestModeEnabled(True)
-    QtCore.QCoreApplication.setOrganizationName("gazou-kiritori-tests")
-    QtCore.QCoreApplication.setApplicationName("characterization-tests")
-    QtCore.QSettings.setDefaultFormat(QtCore.QSettings.Format.IniFormat)
-    for scope in (
-        QtCore.QSettings.Scope.UserScope,
-        QtCore.QSettings.Scope.SystemScope,
-    ):
-        QtCore.QSettings.setPath(
-            QtCore.QSettings.Format.IniFormat,
-            scope,
-            settings_path,
-        )
+        if _qt_settings_directory is None:
+            _qt_settings_directory = tempfile.TemporaryDirectory(
+                prefix="gazou-kiritori-qt-settings-",
+            )
 
-    existing = QtWidgets.QApplication.instance()
-    if existing is not None:
-        _qapplication = existing
-        return existing
+        settings_path = _qt_settings_directory.name
+        QtCore.QStandardPaths.setTestModeEnabled(True)
+        QtCore.QCoreApplication.setOrganizationName("gazou-kiritori-tests")
+        QtCore.QCoreApplication.setApplicationName("characterization-tests")
+        QtCore.QSettings.setDefaultFormat(QtCore.QSettings.Format.IniFormat)
+        for scope in (
+            QtCore.QSettings.Scope.UserScope,
+            QtCore.QSettings.Scope.SystemScope,
+        ):
+            QtCore.QSettings.setPath(
+                QtCore.QSettings.Format.IniFormat,
+                scope,
+                settings_path,
+            )
 
-    _qapplication = QtWidgets.QApplication(["gazou-kiritori-tests"])
-    _qapplication.setQuitOnLastWindowClosed(False)
-    return _qapplication
+        existing = QtWidgets.QApplication.instance()
+        if existing is not None:
+            _qapplication = existing
+            return existing
+
+        _qapplication = QtWidgets.QApplication(["gazou-kiritori-tests"])
+        _qapplication.setQuitOnLastWindowClosed(False)
+        return _qapplication
+    finally:
+        if previous_platform is None:
+            os.environ.pop("QT_QPA_PLATFORM", None)
+        else:
+            os.environ["QT_QPA_PLATFORM"] = previous_platform
 
 
 @contextmanager
