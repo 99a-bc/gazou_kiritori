@@ -113,7 +113,6 @@ class ArchiveLifecycleRegressionTests(unittest.TestCase):
                 b"version 2",
             )
 
-    @unittest.expectedFailure
     def test_casefold_index_is_rebuilt_after_archive_replacement(self) -> None:
         with self._archive_workspace() as temporary_root:
             archive_path = self._write_archive(
@@ -142,6 +141,46 @@ class ArchiveLifecycleRegressionTests(unittest.TestCase):
                 ),
                 "New/Image.PNG",
             )
+            self.assertEqual(
+                application._zip_resolve_inner(
+                    str(archive_path),
+                    "old/photo.png",
+                ),
+                "old/photo.png",
+            )
+
+    def test_casefold_index_cache_reuses_unchanged_archive(self) -> None:
+        with self._archive_workspace() as temporary_root:
+            archive_path = self._write_archive(
+                temporary_root / "casefold-cache.zip",
+                [("Folder/Image.PNG", b"payload")],
+            )
+
+            first_index = application._zip_index_lower(str(archive_path))
+            second_index = application._zip_index_lower(str(archive_path))
+
+            self.assertEqual(second_index, first_index)
+            cache_info = application._zip_index_lower.cache_info()
+            self.assertEqual(cache_info.hits, 1)
+            self.assertEqual(cache_info.misses, 1)
+            self.assertEqual(cache_info.maxsize, 32)
+            self.assertEqual(cache_info.currsize, 1)
+
+    def test_casefold_index_cache_clear_resets_statistics(self) -> None:
+        with self._archive_workspace() as temporary_root:
+            archive_path = self._write_archive(
+                temporary_root / "casefold-cache-clear.zip",
+                [("Folder/Image.PNG", b"payload")],
+            )
+            application._zip_index_lower(str(archive_path))
+
+            application._zip_index_lower.cache_clear()
+
+            cache_info = application._zip_index_lower.cache_info()
+            self.assertEqual(cache_info.hits, 0)
+            self.assertEqual(cache_info.misses, 0)
+            self.assertEqual(cache_info.maxsize, 32)
+            self.assertEqual(cache_info.currsize, 0)
 
     def test_lru_eviction_closes_the_evicted_zip_reader(self) -> None:
         with self._archive_workspace() as temporary_root:

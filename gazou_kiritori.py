@@ -222,7 +222,10 @@ _open_zip_cached.cache_info = _ARCHIVE_READER_CACHE.cache_info
 
 
 @lru_cache(maxsize=32)
-def _zip_index_lower(zip_path: str) -> dict[str, str]:
+def _zip_index_lower_cached(
+    zip_path: str,
+    archive_signature,
+) -> dict[str, str]:
     """
     zip内のエントリを小文字キーで引ける dict を返す。
     { lower(name) : name(オリジナルケース) }
@@ -230,6 +233,16 @@ def _zip_index_lower(zip_path: str) -> dict[str, str]:
     zf = _open_zip_cached(zip_path)
     # getinfoはケース完全一致なので、事前に名寄せテーブルを作る
     return { name.lower(): name for name in zf.namelist() }
+
+
+def _zip_index_lower(zip_path: str) -> dict[str, str]:
+    archive_signature = _archive_cache_signature(zip_path)
+    return _zip_index_lower_cached(zip_path, archive_signature)
+
+
+_zip_index_lower.cache_clear = _zip_index_lower_cached.cache_clear
+_zip_index_lower.cache_info = _zip_index_lower_cached.cache_info
+
 
 def _zip_resolve_inner(zip_path: str, inner: str) -> str:
     """
