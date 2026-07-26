@@ -45,6 +45,7 @@ from vfs_archives import (
     _SevenZipInfoCompat,
     open_physical_archive,
 )
+from vfs_archive_cache import ArchiveReaderCache, physical_archive_signature
 
 APP_NAME = "画像切り取りツール"
 APP_VERSION = "1.2.7" 
@@ -180,8 +181,16 @@ def _register_mem_zip(parent_zip_path: str, inner_name: str) -> str:
     _MEM_ZIP_META[mem_id] = {"outer": parent_zip_path, "inner": inner_real}
     return mem_id
 
-@lru_cache(maxsize=8)
-def _open_zip_cached(zip_path: str):
+def _archive_cache_signature(zip_path: str):
+    if isinstance(zip_path, str) and zip_path.startswith("memzip:"):
+        data = _MEM_ZIP_BYTES.get(zip_path)
+        if data is None:
+            raise FileNotFoundError(f"memzip not registered: {zip_path}")
+        return ("memzip", id(data), len(data))
+    return ("physical",) + physical_archive_signature(zip_path)
+
+
+def _open_zip_uncached(zip_path: str):
     """
     zip_path に応じて ZipFile / RarFile / 7z / memzip を返す。
     戻り値は ZipFile / RarFile / SevenZipCompat 互換を想定。
@@ -196,8 +205,27 @@ def _open_zip_cached(zip_path: str):
 
     return open_physical_archive(zip_path, log_debug=log_debug)
 
+
+_ARCHIVE_READER_CACHE = ArchiveReaderCache(maxsize=8)
+
+
+def _open_zip_cached(zip_path: str):
+    return _ARCHIVE_READER_CACHE.get(
+        zip_path,
+        opener=_open_zip_uncached,
+        signature_factory=_archive_cache_signature,
+    )
+
+
+_open_zip_cached.cache_clear = _ARCHIVE_READER_CACHE.clear
+_open_zip_cached.cache_info = _ARCHIVE_READER_CACHE.cache_info
+
+
 @lru_cache(maxsize=32)
-def _zip_index_lower(zip_path: str) -> dict[str, str]:
+def _zip_index_lower_cached(
+    zip_path: str,
+    archive_signature,
+) -> dict[str, str]:
     """
     zip内のエントリを小文字キーで引ける dict を返す。
     { lower(name) : name(オリジナルケース) }
@@ -205,6 +233,16 @@ def _zip_index_lower(zip_path: str) -> dict[str, str]:
     zf = _open_zip_cached(zip_path)
     # getinfoはケース完全一致なので、事前に名寄せテーブルを作る
     return { name.lower(): name for name in zf.namelist() }
+
+
+def _zip_index_lower(zip_path: str) -> dict[str, str]:
+    archive_signature = _archive_cache_signature(zip_path)
+    return _zip_index_lower_cached(zip_path, archive_signature)
+
+
+_zip_index_lower.cache_clear = _zip_index_lower_cached.cache_clear
+_zip_index_lower.cache_info = _zip_index_lower_cached.cache_info
+
 
 def _zip_resolve_inner(zip_path: str, inner: str) -> str:
     """
