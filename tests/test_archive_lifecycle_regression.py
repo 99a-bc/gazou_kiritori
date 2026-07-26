@@ -90,7 +90,6 @@ class ArchiveLifecycleRegressionTests(unittest.TestCase):
                 # Release Windows archive handles before TemporaryDirectory exits.
                 self._restore_module_state()
 
-    @unittest.expectedFailure
     def test_closed_cached_reader_is_reopened_after_archive_replacement(
         self,
     ) -> None:
@@ -144,7 +143,6 @@ class ArchiveLifecycleRegressionTests(unittest.TestCase):
                 "New/Image.PNG",
             )
 
-    @unittest.expectedFailure
     def test_lru_eviction_closes_the_evicted_zip_reader(self) -> None:
         with self._archive_workspace() as temporary_root:
             archive_paths = [
@@ -172,6 +170,29 @@ class ArchiveLifecycleRegressionTests(unittest.TestCase):
             self.assertIsNot(reopened_first, first_reader)
 
             self.assertIsNone(first_reader.fp)
+
+    def test_cache_clear_closes_all_cached_readers(self) -> None:
+        with self._archive_workspace() as temporary_root:
+            archive_paths = [
+                self._write_archive(
+                    temporary_root / f"clear-{index}.zip",
+                    [(f"entry-{index}.txt", str(index).encode("ascii"))],
+                )
+                for index in range(3)
+            ]
+            readers = [
+                self._open_archive(archive_path)
+                for archive_path in archive_paths
+            ]
+            self.assertTrue(all(reader.fp is not None for reader in readers))
+
+            application._open_zip_cached.cache_clear()
+
+            self.assertTrue(all(reader.fp is None for reader in readers))
+            cache_info = application._open_zip_cached.cache_info()
+            self.assertEqual(cache_info.currsize, 0)
+            self.assertEqual(cache_info.hits, 0)
+            self.assertEqual(cache_info.misses, 0)
 
     def test_workspace_cleanup_releases_handles_and_restores_module_state(
         self,
