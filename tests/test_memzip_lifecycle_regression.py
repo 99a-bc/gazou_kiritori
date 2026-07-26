@@ -119,12 +119,14 @@ class MemZipLifecycleRegressionTests(unittest.TestCase):
                 # Release Windows archive handles before removing the ZIP files.
                 self._restore_module_state()
 
-    @unittest.expectedFailure
     def test_outer_archive_replacement_refreshes_nested_memzip_contents(
         self,
     ) -> None:
         version_one = self._archive_bytes([("old.txt", b"old")])
-        version_two = self._archive_bytes([("new.txt", b"new")])
+        version_two = self._archive_bytes(
+            [("new.txt", b"new payload with a different size")]
+        )
+        starting_counter = application._MEM_ZIP_COUNTER
 
         with self._archive_workspace() as temporary_root:
             outer_path = self._write_archive(
@@ -144,12 +146,15 @@ class MemZipLifecycleRegressionTests(unittest.TestCase):
             first_memzip_id = self._memzip_id(first_items)
             self.assertIn(first_memzip_id, application._MEM_ZIP_BYTES)
             self.assertIn(first_memzip_id, application._MEM_ZIP_META)
+            first_reader = self._track_reader(first_memzip_id)
+            first_bytes = application._MEM_ZIP_BYTES[first_memzip_id]
+            first_metadata = dict(application._MEM_ZIP_META[first_memzip_id])
+            first_signature = application._archive_cache_signature(
+                first_memzip_id
+            )
+            self.assertEqual(first_reader.namelist(), ["old.txt"])
+            self.assertEqual(first_reader.read("old.txt"), b"old")
 
-            application._zip_index_lower.cache_clear()
-            application._open_zip_cached.cache_clear()
-
-            self.assertIn(first_memzip_id, application._MEM_ZIP_BYTES)
-            self.assertIn(first_memzip_id, application._MEM_ZIP_META)
             self._write_archive(
                 outer_path,
                 [("inner.zip", version_two)],
@@ -159,6 +164,38 @@ class MemZipLifecycleRegressionTests(unittest.TestCase):
             self.assertEqual(
                 {item["name"] for item in second_items},
                 {"new.txt"},
+            )
+            second_memzip_id = self._memzip_id(second_items)
+            second_reader = self._track_reader(second_memzip_id)
+
+            self.assertNotEqual(second_memzip_id, first_memzip_id)
+            self.assertIsNotNone(first_reader.fp)
+            self.assertEqual(first_reader.namelist(), ["old.txt"])
+            self.assertEqual(first_reader.read("old.txt"), b"old")
+            self.assertEqual(second_reader.namelist(), ["new.txt"])
+            self.assertEqual(
+                second_reader.read("new.txt"),
+                b"new payload with a different size",
+            )
+            self.assertIs(
+                application._MEM_ZIP_BYTES[first_memzip_id],
+                first_bytes,
+            )
+            self.assertEqual(
+                application._MEM_ZIP_META[first_memzip_id],
+                first_metadata,
+            )
+            self.assertEqual(
+                application._archive_cache_signature(first_memzip_id),
+                first_signature,
+            )
+            self.assertEqual(
+                set(application._MEM_ZIP_BYTES),
+                set(application._MEM_ZIP_META),
+            )
+            self.assertEqual(
+                application._MEM_ZIP_COUNTER,
+                starting_counter + 2,
             )
 
     def test_distinct_inner_archives_have_distinct_consistent_registrations(

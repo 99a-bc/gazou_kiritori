@@ -7,6 +7,7 @@ import traceback
 import time
 import tempfile
 import subprocess
+from threading import Lock
 from pathlib import Path
 from io import BytesIO
 
@@ -46,6 +47,7 @@ from vfs_archives import (
     open_physical_archive,
 )
 from vfs_archive_cache import ArchiveReaderCache, physical_archive_signature
+from vfs_memzip import MemZipRegistry
 
 APP_NAME = "画像切り取りツール"
 APP_VERSION = "1.2.7" 
@@ -71,9 +73,11 @@ _IMG_CACHE = OrderedDict()
 _IMG_CACHE_MAX = 8
 
 # --- zip内zip 用：メモリ上に展開した zip 本体 ---
-_MEM_ZIP_BYTES: dict[str, bytes] = {}
-_MEM_ZIP_META: dict[str, dict] = {}
+_MEM_ZIP_REGISTRY = MemZipRegistry()
+_MEM_ZIP_BYTES = _MEM_ZIP_REGISTRY.bytes_by_id
+_MEM_ZIP_META = _MEM_ZIP_REGISTRY.metadata_by_id
 _MEM_ZIP_COUNTER = 0
+_MEM_ZIP_COMPAT_LOCK = Lock()
 
 from html import escape
 
@@ -164,29 +168,28 @@ def _register_mem_zip(parent_zip_path: str, inner_name: str) -> str:
 
     inner_norm = (inner_name or "").replace("\\", "/")
 
-    # 既に登録済みかチェック（親zip + エントリ名の組み合わせでユニーク）
-    for mid, meta in _MEM_ZIP_META.items():
-        if meta.get("outer") == parent_zip_path and meta.get("inner") == inner_norm:
-            return mid
+    outer_signature = _archive_cache_signature(parent_zip_path)
 
-    zf = _open_zip_cached(parent_zip_path)
-    # ケース非依存で実在名に解決
-    inner_real = _zip_resolve_inner(parent_zip_path, inner_norm)
-    data = zf.read(inner_real)
+    def load_inner_zip() -> tuple[str, bytes]:
+        zf = _open_zip_cached(parent_zip_path)
+        # ケース非依存で実在名に解決
+        inner_real = _zip_resolve_inner(parent_zip_path, inner_norm)
+        return inner_real, zf.read(inner_real)
 
-    mem_id = f"memzip:{_MEM_ZIP_COUNTER}"
-    _MEM_ZIP_COUNTER += 1
-
-    _MEM_ZIP_BYTES[mem_id] = data
-    _MEM_ZIP_META[mem_id] = {"outer": parent_zip_path, "inner": inner_real}
-    return mem_id
+    with _MEM_ZIP_COMPAT_LOCK:
+        _MEM_ZIP_REGISTRY.counter = _MEM_ZIP_COUNTER
+        mem_id = _MEM_ZIP_REGISTRY.register(
+            parent_zip_path,
+            inner_norm,
+            outer_signature,
+            load_inner_zip,
+        )
+        _MEM_ZIP_COUNTER = _MEM_ZIP_REGISTRY.counter
+        return mem_id
 
 def _archive_cache_signature(zip_path: str):
     if isinstance(zip_path, str) and zip_path.startswith("memzip:"):
-        data = _MEM_ZIP_BYTES.get(zip_path)
-        if data is None:
-            raise FileNotFoundError(f"memzip not registered: {zip_path}")
-        return ("memzip", id(data), len(data))
+        return _MEM_ZIP_REGISTRY.signature(zip_path)
     return ("physical",) + physical_archive_signature(zip_path)
 
 
@@ -198,9 +201,7 @@ def _open_zip_uncached(zip_path: str):
     """
     # memzip: メモリ上に展開済みの zip（ここは従来どおり ZipFile 固定）
     if isinstance(zip_path, str) and zip_path.startswith("memzip:"):
-        data = _MEM_ZIP_BYTES.get(zip_path)
-        if data is None:
-            raise FileNotFoundError(f"memzip not registered: {zip_path}")
+        data = _MEM_ZIP_REGISTRY.get_bytes(zip_path)
         return zipfile.ZipFile(BytesIO(data), "r")
 
     return open_physical_archive(zip_path, log_debug=log_debug)
