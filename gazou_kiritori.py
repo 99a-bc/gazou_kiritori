@@ -71,6 +71,7 @@ from vfs_paths import (
 from collections import OrderedDict
 _IMG_CACHE = OrderedDict()
 _IMG_CACHE_MAX = 8
+_SHUTDOWN_WORKER_WAIT_MS = 5000
 
 # --- zip内zip 用：メモリ上に展開した zip 本体 ---
 _MEM_ZIP_REGISTRY = MemZipRegistry()
@@ -251,6 +252,94 @@ def _zip_index_lower(zip_path: str) -> dict[str, str]:
 
 _zip_index_lower.cache_clear = _zip_index_lower_cached.cache_clear
 _zip_index_lower.cache_info = _zip_index_lower_cached.cache_info
+
+
+def _log_shutdown_cleanup_issue(message: str) -> None:
+    try:
+        log_debug(message)
+    except Exception:
+        pass
+
+
+def _cleanup_application_resources(thread_pool=None) -> bool:
+    """Release application resources after every worker has stopped."""
+    try:
+        pool = (
+            thread_pool
+            if thread_pool is not None
+            else QtCore.QThreadPool.globalInstance()
+        )
+        pool.clear()
+        workers_finished = pool.waitForDone(_SHUTDOWN_WORKER_WAIT_MS)
+    except Exception as error:
+        _log_shutdown_cleanup_issue(
+            f"[shutdown] worker cleanup failed: {error!r}"
+        )
+        return False
+
+    if workers_finished is False:
+        _log_shutdown_cleanup_issue(
+            "[shutdown] worker cleanup timed out; resources retained"
+        )
+        return False
+
+    try:
+        _zip_index_lower.cache_clear()
+    except Exception as error:
+        _log_shutdown_cleanup_issue(
+            f"[shutdown] index cache cleanup failed: {error!r}"
+        )
+        return False
+
+    try:
+        _open_zip_cached.cache_clear()
+    except Exception as error:
+        _log_shutdown_cleanup_issue(
+            f"[shutdown] archive cache cleanup failed: {error!r}"
+        )
+        return False
+
+    try:
+        with _MEM_ZIP_COMPAT_LOCK:
+            _MEM_ZIP_REGISTRY.clear()
+    except Exception as error:
+        _log_shutdown_cleanup_issue(
+            f"[shutdown] memzip cleanup failed: {error!r}"
+        )
+        return False
+
+    closed_image_ids: set[int] = set()
+    for item in tuple(_IMG_CACHE.values()):
+        try:
+            image = item.get("img") if isinstance(item, dict) else None
+            if image is None:
+                continue
+            image_id = id(image)
+            if image_id in closed_image_ids:
+                continue
+            closed_image_ids.add(image_id)
+            close = getattr(image, "close", None)
+            if callable(close):
+                close()
+        except Exception as error:
+            _log_shutdown_cleanup_issue(
+                f"[shutdown] image cleanup failed: {error!r}"
+            )
+
+    try:
+        _IMG_CACHE.clear()
+    except Exception as error:
+        _log_shutdown_cleanup_issue(
+            f"[shutdown] image cache cleanup failed: {error!r}"
+        )
+        return False
+
+    return True
+
+
+def _install_application_cleanup(app) -> None:
+    """Install the single normal-shutdown resource cleanup hook."""
+    app.aboutToQuit.connect(_cleanup_application_resources)
 
 
 def _zip_resolve_inner(zip_path: str, inner: str) -> str:
@@ -16227,6 +16316,7 @@ if __name__ == "__main__":
     log_debug(f"[ENV] VIRTUAL_ENV   = {os.environ.get('VIRTUAL_ENV')}")
 
     app = QtWidgets.QApplication(sys.argv)
+    _install_application_cleanup(app)
 
     app.setStyleSheet(app.styleSheet() + """
     QToolTip {
