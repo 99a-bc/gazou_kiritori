@@ -69,7 +69,8 @@ class _EvictionOutcome:
     held_reader_count: int
     cache_maxsize: int | None
     cache_currsize: int | None
-    target_reader_closed: bool
+    target_reader_closed_during_eviction: bool
+    target_reader_closed_after_release: bool
     target_open_count: int
     events: tuple[tuple[int, str, bytes, int], ...]
     target_path: str
@@ -171,22 +172,24 @@ class ArchiveCoverThumbnailRegressionTests(unittest.TestCase):
                 generation,
             )
             original_open = application._open_zip_cached
+            original_lease = application._lease_zip_cached
 
-            def controlled_open(path: str):
+            @contextmanager
+            def controlled_lease(path: str):
                 nonlocal target_open_count
-                reader = original_open(path)
-                if path == target_path:
-                    target_open_count += 1
-                    # First call lists the archive. The second reader is the one
-                    # retained by _DirOverlayTask immediately before image open.
-                    if target_open_count == 2:
-                        held_readers.append(reader)
-                        reader_acquired.set()
-                        if not release_reader.wait(EVENT_TIMEOUT_SECONDS):
-                            raise TimeoutError(
-                                "timed out waiting to resume overlay reader"
-                            )
-                return reader
+                with original_lease(path) as reader:
+                    if path == target_path:
+                        target_open_count += 1
+                        # First lease lists the archive. The second protects the
+                        # reader retained immediately before image open.
+                        if target_open_count == 2:
+                            held_readers.append(reader)
+                            reader_acquired.set()
+                            if not release_reader.wait(EVENT_TIMEOUT_SECONDS):
+                                raise TimeoutError(
+                                    "timed out waiting to resume overlay reader"
+                                )
+                    yield reader
 
             def run_task() -> None:
                 try:
@@ -200,12 +203,12 @@ class ArchiveCoverThumbnailRegressionTests(unittest.TestCase):
             )
             acquired_in_time = False
             cache_during_eviction = None
-            target_reader_closed = False
+            target_reader_closed_during_eviction = True
 
             with mock.patch.object(
                 application,
-                "_open_zip_cached",
-                side_effect=controlled_open,
+                "_lease_zip_cached",
+                side_effect=controlled_lease,
             ):
                 worker.start()
                 try:
@@ -214,13 +217,18 @@ class ArchiveCoverThumbnailRegressionTests(unittest.TestCase):
                     )
                     if acquired_in_time:
                         for archive_path in archive_paths[1:]:
-                            application._open_zip_cached(str(archive_path))
+                            original_open(str(archive_path))
                         cache_during_eviction = original_open.cache_info()
-                        target_reader_closed = held_readers[0].fp is None
+                        target_reader_closed_during_eviction = (
+                            held_readers[0].fp is None
+                        )
                 finally:
                     release_reader.set()
                     worker.join(EVENT_TIMEOUT_SECONDS)
 
+            target_reader_closed_after_release = (
+                len(held_readers) == 1 and held_readers[0].fp is None
+            )
             return _EvictionOutcome(
                 acquired_in_time=acquired_in_time,
                 worker_alive=worker.is_alive(),
@@ -236,7 +244,12 @@ class ArchiveCoverThumbnailRegressionTests(unittest.TestCase):
                     if cache_during_eviction is not None
                     else None
                 ),
-                target_reader_closed=target_reader_closed,
+                target_reader_closed_during_eviction=(
+                    target_reader_closed_during_eviction
+                ),
+                target_reader_closed_after_release=(
+                    target_reader_closed_after_release
+                ),
                 target_open_count=target_open_count,
                 events=tuple(model.dirOverlayReady.events),
                 target_path=target_path,
@@ -244,7 +257,7 @@ class ArchiveCoverThumbnailRegressionTests(unittest.TestCase):
                 generation=generation,
             )
 
-    def test_lru_eviction_closes_active_reader_and_suppresses_overlay(
+    def test_lru_eviction_defers_close_and_overlay_still_emits(
         self,
     ) -> None:
         outcome = self._exercise_active_reader_eviction()
@@ -255,26 +268,30 @@ class ArchiveCoverThumbnailRegressionTests(unittest.TestCase):
         self.assertEqual(outcome.held_reader_count, 1)
         self.assertEqual(outcome.cache_maxsize, 8)
         self.assertEqual(outcome.cache_currsize, 8)
-        self.assertTrue(outcome.target_reader_closed)
+        self.assertFalse(outcome.target_reader_closed_during_eviction)
+        self.assertTrue(outcome.target_reader_closed_after_release)
         self.assertGreaterEqual(outcome.target_open_count, 3)
-        self.assertEqual(outcome.events, ())
+        self.assertEqual(len(outcome.events), 1)
 
-    @unittest.expectedFailure
     def test_active_overlay_generation_survives_unrelated_lru_eviction(
         self,
     ) -> None:
         outcome = self._exercise_active_reader_eviction()
 
-        # Desired behavior: an already-started overlay should retain a valid
-        # reader and still publish its result. The current cache closes that
-        # reader during eviction, so _DirOverlayTask catches the open error
-        # and emits nothing.
+        self.assertTrue(outcome.acquired_in_time)
+        self.assertFalse(outcome.worker_alive)
+        self.assertEqual(outcome.worker_errors, ())
+        self.assertFalse(outcome.target_reader_closed_during_eviction)
+        self.assertTrue(outcome.target_reader_closed_after_release)
         self.assertEqual(len(outcome.events), 1)
         emitted_row, emitted_path, png, emitted_generation = outcome.events[0]
         self.assertEqual(emitted_row, outcome.row)
         self.assertEqual(emitted_path, outcome.target_path)
         self.assertEqual(emitted_generation, outcome.generation)
         self.assertTrue(png)
+        with Image.open(BytesIO(png)) as generated:
+            generated.load()
+            self.assertEqual(generated.format, "PNG")
 
 
 def tearDownModule() -> None:
