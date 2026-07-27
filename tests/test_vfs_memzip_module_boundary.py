@@ -141,6 +141,72 @@ if loaded:
             set(registry.metadata_by_id),
         )
 
+    def test_clear_empties_registrations_without_reusing_ids(self) -> None:
+        registry = MemZipRegistry()
+        old_ids = [
+            registry.register(
+                "outer.zip",
+                "inner.zip",
+                ("physical", version),
+                lambda version=version: (
+                    "inner.zip",
+                    bytes([version]),
+                ),
+            )
+            for version in range(2)
+        ]
+        counter_before_clear = registry.counter
+
+        registry.clear()
+
+        self.assertEqual(registry.bytes_by_id, {})
+        self.assertEqual(registry.metadata_by_id, {})
+        self.assertEqual(registry._registrations, {})
+        self.assertEqual(registry.counter, counter_before_clear)
+        for old_id in old_ids:
+            with self.subTest(old_id=old_id):
+                with self.assertRaises(FileNotFoundError):
+                    registry.get_bytes(old_id)
+
+        new_id = registry.register(
+            "outer.zip",
+            "inner.zip",
+            ("physical", 2),
+            lambda: ("inner.zip", b"new"),
+        )
+        self.assertNotIn(new_id, old_ids)
+        self.assertGreater(
+            int(new_id.removeprefix("memzip:")),
+            max(
+                int(old_id.removeprefix("memzip:"))
+                for old_id in old_ids
+            ),
+        )
+
+    def test_clear_preserves_dictionary_identity_and_is_idempotent(self) -> None:
+        registry = MemZipRegistry()
+        bytes_reference = registry.bytes_by_id
+        metadata_reference = registry.metadata_by_id
+        registrations_reference = registry._registrations
+        registry.register(
+            "outer.zip",
+            "inner.zip",
+            ("physical", 1),
+            lambda: ("inner.zip", b"payload"),
+        )
+        counter_before_clear = registry.counter
+
+        registry.clear()
+        registry.clear()
+
+        self.assertIs(registry.bytes_by_id, bytes_reference)
+        self.assertIs(registry.metadata_by_id, metadata_reference)
+        self.assertIs(registry._registrations, registrations_reference)
+        self.assertEqual(bytes_reference, {})
+        self.assertEqual(metadata_reference, {})
+        self.assertEqual(registrations_reference, {})
+        self.assertEqual(registry.counter, counter_before_clear)
+
     def test_missing_id_raises_file_not_found(self) -> None:
         registry = MemZipRegistry()
 

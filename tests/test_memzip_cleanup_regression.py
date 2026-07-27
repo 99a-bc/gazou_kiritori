@@ -95,7 +95,6 @@ class MemZipRegistryCleanupRegressionTests(unittest.TestCase):
         self.assertEqual(len(registry._registrations), 1)
         self.assertEqual(registry.counter, 1)
 
-    @unittest.expectedFailure
     def test_clear_discards_registrations_without_reusing_ids(self) -> None:
         registry = MemZipRegistry()
         old_id = registry.register(
@@ -106,11 +105,12 @@ class MemZipRegistryCleanupRegressionTests(unittest.TestCase):
         )
         counter_before_clear = registry.counter
 
-        registry.clear()  # type: ignore[attr-defined]
+        registry.clear()
 
         self.assertEqual(registry.bytes_by_id, {})
         self.assertEqual(registry.metadata_by_id, {})
         self.assertEqual(registry._registrations, {})
+        self.assertEqual(registry.counter, counter_before_clear)
         with self.assertRaises(FileNotFoundError):
             registry.get_bytes(old_id)
 
@@ -121,6 +121,10 @@ class MemZipRegistryCleanupRegressionTests(unittest.TestCase):
             lambda: ("inner.zip", b"new"),
         )
         self.assertNotEqual(new_id, old_id)
+        self.assertGreater(
+            int(new_id.removeprefix("memzip:")),
+            int(old_id.removeprefix("memzip:")),
+        )
         self.assertEqual(registry.counter, counter_before_clear + 1)
 
 

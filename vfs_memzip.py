@@ -115,6 +115,13 @@ class MemZipRegistry:
             )
             return memzip_id
 
+    def clear(self) -> None:
+        """Discard registrations without resetting the monotonic ID counter."""
+        with self._lock:
+            self.bytes_by_id.clear()
+            self.metadata_by_id.clear()
+            self._registrations.clear()
+
     def get_bytes(self, memzip_id: str) -> bytes:
         """Return registered bytes or raise the legacy missing-ID error."""
         with self._lock:
