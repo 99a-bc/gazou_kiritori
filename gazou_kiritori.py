@@ -115,15 +115,15 @@ def _sig_for(path_or_uri: str):
     import os
     if is_zip_uri(path_or_uri):
         zp, inner = parse_zip_uri(path_or_uri)
-        zf = _open_zip_cached(zp)
-        # ★ まずケース非依存で実在名に解決
-        inner2 = _zip_resolve_inner(zp, inner)
-        try:
-            info = zf.getinfo(inner2)
-            return ("zip", norm_vpath(zp), inner2, info.CRC, info.file_size, info.date_time)
-        except KeyError:
-            # 署名が取れないときは ZIP + inner（正規化）の簡易署名で代用（キャッシュ精度は下がるが動作はする）
-            return ("zip", norm_vpath(zp), inner.lower())
+        with _lease_zip_cached(zp) as zf:
+            # ★ まずケース非依存で実在名に解決
+            inner2 = _zip_resolve_inner(zp, inner)
+            try:
+                info = zf.getinfo(inner2)
+                return ("zip", norm_vpath(zp), inner2, info.CRC, info.file_size, info.date_time)
+            except KeyError:
+                # 署名が取れないときは ZIP + inner（正規化）の簡易署名で代用（キャッシュ精度は下がるが動作はする）
+                return ("zip", norm_vpath(zp), inner.lower())
     else:
         st = os.stat(path_or_uri)
         return ("disk", norm_vpath(path_or_uri), st.st_mtime_ns, st.st_size)
@@ -171,10 +171,10 @@ def _register_mem_zip(parent_zip_path: str, inner_name: str) -> str:
     outer_signature = _archive_cache_signature(parent_zip_path)
 
     def load_inner_zip() -> tuple[str, bytes]:
-        zf = _open_zip_cached(parent_zip_path)
-        # ケース非依存で実在名に解決
-        inner_real = _zip_resolve_inner(parent_zip_path, inner_norm)
-        return inner_real, zf.read(inner_real)
+        with _lease_zip_cached(parent_zip_path) as zf:
+            # ケース非依存で実在名に解決
+            inner_real = _zip_resolve_inner(parent_zip_path, inner_norm)
+            return inner_real, zf.read(inner_real)
 
     with _MEM_ZIP_COMPAT_LOCK:
         _MEM_ZIP_REGISTRY.counter = _MEM_ZIP_COUNTER
@@ -218,6 +218,14 @@ def _open_zip_cached(zip_path: str):
     )
 
 
+def _lease_zip_cached(zip_path: str):
+    return _ARCHIVE_READER_CACHE.lease(
+        zip_path,
+        opener=_open_zip_uncached,
+        signature_factory=_archive_cache_signature,
+    )
+
+
 _open_zip_cached.cache_clear = _ARCHIVE_READER_CACHE.clear
 _open_zip_cached.cache_info = _ARCHIVE_READER_CACHE.cache_info
 
@@ -231,9 +239,9 @@ def _zip_index_lower_cached(
     zip内のエントリを小文字キーで引ける dict を返す。
     { lower(name) : name(オリジナルケース) }
     """
-    zf = _open_zip_cached(zip_path)
-    # getinfoはケース完全一致なので、事前に名寄せテーブルを作る
-    return { name.lower(): name for name in zf.namelist() }
+    with _lease_zip_cached(zip_path) as zf:
+        # getinfoはケース完全一致なので、事前に名寄せテーブルを作る
+        return { name.lower(): name for name in zf.namelist() }
 
 
 def _zip_index_lower(zip_path: str) -> dict[str, str]:
@@ -263,12 +271,13 @@ def _is_noise_entry(name: str) -> bool:
 
 def _zip_list_children(zip_path: str, inner_dir: str):
     """zip内の inner_dir 直下の子を一段だけ列挙。"""
-    zf = _open_zip_cached(zip_path)
+    with _lease_zip_cached(zip_path) as zf:
+        names = zf.namelist()
     inner = (inner_dir or "").strip("/")
     prefix = (inner + "/") if inner else ""
     seen_dirs = set()
     children = []
-    for n in zf.namelist():
+    for n in names:
         if not n.startswith(prefix):
             continue
         rest = n[len(prefix):]
@@ -402,8 +411,8 @@ def vfs_parent(path_or_uri: str) -> str | None:
 def open_bytes_any(path_or_uri: str) -> bytes:
     if is_zip_uri(path_or_uri):
         zp, inner = parse_zip_uri(path_or_uri)
-        zf = _open_zip_cached(zp)
-        return zf.read(inner)  # メモリに読み出し（temp展開なし）
+        with _lease_zip_cached(zp) as zf:
+            return zf.read(inner)  # メモリに読み出し（temp展開なし）
     with open(path_or_uri, "rb") as f:
         return f.read()
 
@@ -411,17 +420,17 @@ def open_image_any(path_or_uri):
     from PIL import Image, ImageOps
     if is_zip_uri(path_or_uri):
         zp, inner = parse_zip_uri(path_or_uri)
-        zf = _open_zip_cached(zp)
-        # ★ ケース非依存に解決（ヒットすれば正しいオリジナル名が戻る）
-        inner2 = _zip_resolve_inner(zp, inner)
-        try:
-            with zf.open(inner2, "r") as f:   # ストリーミングで読む（中間コピー削減）
-                im = Image.open(f)
-                im.load()                     # ここでデコードを完了させてクローズ可に
-        except KeyError:
-            # どうしても見つからない場合は元の名前で再挑戦（念のため）
-            with zf.open(inner, "r") as f:
-                im = Image.open(f); im.load()
+        with _lease_zip_cached(zp) as zf:
+            # ★ ケース非依存に解決（ヒットすれば正しいオリジナル名が戻る）
+            inner2 = _zip_resolve_inner(zp, inner)
+            try:
+                with zf.open(inner2, "r") as f:   # ストリーミングで読む（中間コピー削減）
+                    im = Image.open(f)
+                    im.load()                     # ここでデコードを完了させてクローズ可に
+            except KeyError:
+                # どうしても見つからない場合は元の名前で再挑戦（念のため）
+                with zf.open(inner, "r") as f:
+                    im = Image.open(f); im.load()
         return ImageOps.exif_transpose(im)
     else:
         im = Image.open(path_or_uri)
@@ -448,23 +457,23 @@ def make_fixed_thumbnail_any(path_or_uri, thumb_size=(80, 120)):
         # まずは「軽い読み方」で開く（フル解像度の EXIF 回転は行わない）
         if is_zip_uri(path_or_uri):
             zp, inner = parse_zip_uri(path_or_uri)
-            zf = _open_zip_cached(zp)
-            # ケース非依存に解決（見つかればオリジナル名に）
-            inner2 = _zip_resolve_inner(zp, inner)
-            try:
-                f = zf.open(inner2, "r")
-            except KeyError:
-                # 念のため元名でもう一度
-                f = zf.open(inner, "r")
-            with f:
-                im = Image.open(f)
-                # JPEG の場合は draft で読み取り負荷を軽減（効くフォーマットだけ）
-                if getattr(im, "format", None) == "JPEG":
-                    try:
-                        im.draft("RGB", thumb_size)
-                    except Exception:
-                        pass
-                im.load()
+            with _lease_zip_cached(zp) as zf:
+                # ケース非依存に解決（見つかればオリジナル名に）
+                inner2 = _zip_resolve_inner(zp, inner)
+                try:
+                    f = zf.open(inner2, "r")
+                except KeyError:
+                    # 念のため元名でもう一度
+                    f = zf.open(inner, "r")
+                with f:
+                    im = Image.open(f)
+                    # JPEG の場合は draft で読み取り負荷を軽減（効くフォーマットだけ）
+                    if getattr(im, "format", None) == "JPEG":
+                        try:
+                            im.draft("RGB", thumb_size)
+                        except Exception:
+                            pass
+                    im.load()
         else:
             im = Image.open(path_or_uri)
             if getattr(im, "format", None) == "JPEG":
@@ -4953,34 +4962,33 @@ class _DirOverlayTask(QtCore.QRunnable):
             if is_zip_uri(pick):
                 # zip / rar / 7z 内ファイル
                 zp, inner = parse_zip_uri(pick)
-                zf = _open_zip_cached(zp)
+                with _lease_zip_cached(zp) as zf:
+                    # ケース非依存名を解決
+                    inner2 = _zip_resolve_inner(zp, inner)
+                    try:
+                        f = zf.open(inner2, "r")
+                    except KeyError:
+                        f = zf.open(inner, "r")
 
-                # ケース非依存名を解決
-                inner2 = _zip_resolve_inner(zp, inner)
-                try:
-                    f = zf.open(inner2, "r")
-                except KeyError:
-                    f = zf.open(inner, "r")
+                    with f:
+                        im = Image.open(f)
+                        w, h = im.size
+                        if w * h > MAX_PIXELS_FOR_OVERLAY:
+                            log_debug(f"[overlay] skip huge image in zip ({w}x{h}) for {pick!r}")
+                            _dbg_time(f"[overlay] end   row={self.row} path={self.path} (huge zip image)", t0)
+                            return
 
-                with f:
-                    im = Image.open(f)
-                    w, h = im.size
-                    if w * h > MAX_PIXELS_FOR_OVERLAY:
-                        log_debug(f"[overlay] skip huge image in zip ({w}x{h}) for {pick!r}")
-                        _dbg_time(f"[overlay] end   row={self.row} path={self.path} (huge zip image)", t0)
-                        return
+                        # ★ ここでも途中でフォルダ変わってたらやめる
+                        if self.gen != getattr(self.model, "_gen", 0):
+                            _dbg_time(f"[overlay] end   row={self.row} path={self.path} (gen changed mid-zip)", t0)
+                            return
 
-                    # ★ ここでも途中でフォルダ変わってたらやめる
-                    if self.gen != getattr(self.model, "_gen", 0):
-                        _dbg_time(f"[overlay] end   row={self.row} path={self.path} (gen changed mid-zip)", t0)
-                        return
-
-                    if getattr(im, "format", None) == "JPEG":
-                        try:
-                            im.draft("RGB", (max_px, max_px))
-                        except Exception:
-                            pass
-                    im.load()
+                        if getattr(im, "format", None) == "JPEG":
+                            try:
+                                im.draft("RGB", (max_px, max_px))
+                            except Exception:
+                                pass
+                        im.load()
             else:
                 # 物理ファイル
                 im = Image.open(pick)
